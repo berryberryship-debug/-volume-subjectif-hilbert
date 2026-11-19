@@ -1,5 +1,11 @@
+
 # Volume subjectif & géométrie des états vécus
 
+> **Terminologie** — \(V_\psi\) désigne un volume géométrique calculé dans
+> un espace de représentation calibré à partir de données psychophysiques.
+> Il ne constitue ni un volume physique, ni une mesure directe de la
+> conscience, ni une propriété neuronale établie.
+> 
 Cadre computationnel et psychophysique destiné à reconstruire une géométrie relationnelle d'états subjectifs à partir de données comportementales, puis à évaluer sa reproductibilité hors échantillon.
 
 Le projet distingue explicitement :
