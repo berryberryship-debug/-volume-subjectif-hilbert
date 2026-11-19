@@ -579,12 +579,32 @@ def fit_local_metric_at_anchor(
 # 4. INTERPOLATION DES MÉTRIQUES LOCALES
 # ============================================================================
 
+_INTERPOLATIONS = ("linear", "log_euclidean")
+
+
+def _check_interpolation(interpolation: Any) -> str:
+    if interpolation not in _INTERPOLATIONS:
+        raise ValueError(
+            f"interpolation doit appartenir à {_INTERPOLATIONS} ; "
+            f"valeur reçue : {interpolation!r}."
+        )
+    return str(interpolation)
+
+
 def _prepare_anchor_metrics(
     anchor_points: np.ndarray,
     anchor_metrics: np.ndarray,
     eig_floor: float,
+    interpolation: str = "linear",
 ):
-    """Valide les ancres et régularise leurs métriques UNE seule fois."""
+    """
+    Valide les ancres et régularise leurs métriques UNE seule fois.
+
+    Retourne (ancres, charge) où la charge est la pile de métriques SPD
+    (interpolation "linear") ou la pile de leurs logarithmes matriciels
+    (interpolation "log_euclidean").
+    """
+    interpolation = _check_interpolation(interpolation)
     anchors = _validate_points(anchor_points, "anchor_points")
     metrics = _as_finite_array(anchor_metrics, "anchor_metrics", ndim=3)
     n_anchors, d = anchors.shape
@@ -594,7 +614,14 @@ def _prepare_anchor_metrics(
             "anchor_metrics doit avoir la forme "
             "(n_anchors, dimension, dimension)."
         )
-    return anchors, _ensure_spd(metrics, eig_floor=eig_floor)
+    spd = _ensure_spd(metrics, eig_floor=eig_floor)
+    if interpolation == "log_euclidean":
+        eigvals, eigvecs = np.linalg.eigh(spd)
+        logs = (eigvecs * np.log(eigvals)[..., None, :]) @ np.swapaxes(
+            eigvecs, -1, -2
+        )
+        return anchors, 0.5 * (logs + np.swapaxes(logs, -1, -2))
+    return anchors, spd
 
 
 def _interpolate_prepared(
@@ -603,8 +630,9 @@ def _interpolate_prepared(
     spd_metrics: np.ndarray,
     bandwidth: float,
     eig_floor: float,
+    interpolation: str = "linear",
 ) -> np.ndarray:
-    """Interpolation par lot avec ancres déjà validées et régularisées."""
+    """Interpolation par lot avec ancres déjà validées et préparées."""
     distances_sq = np.sum(
         (X[:, None, :] - anchors[None, :, :]) ** 2, axis=2
     )  # (m, n_anchors)
@@ -624,6 +652,17 @@ def _interpolate_prepared(
 
     weights /= weight_sum
     G = np.einsum("mn,nij->mij", weights, spd_metrics)
+
+    if interpolation == "log_euclidean":
+        # Moyenne pondérée des logarithmes, puis exponentielle : SPD par
+        # construction (géométrie log-euclidienne).
+        G = 0.5 * (G + np.swapaxes(G, -1, -2))
+        eigvals, eigvecs = np.linalg.eigh(G)
+        G = (eigvecs * np.exp(eigvals)[..., None, :]) @ np.swapaxes(
+            eigvecs, -1, -2
+        )
+        return 0.5 * (G + np.swapaxes(G, -1, -2))
+
     return _ensure_spd(G, eig_floor=eig_floor)
 
 
@@ -640,23 +679,33 @@ def interpolate_local_metric_batch(
     anchor_metrics: np.ndarray,
     bandwidth: float,
     eig_floor: float = 1e-9,
+    interpolation: str = "linear",
 ) -> np.ndarray:
     """
     Interpole G(x) pour un lot de points : (m, d) -> (m, d, d).
 
         w_i ∝ exp(-||x - a_i||² / (2 h²))
 
-    La combinaison convexe de matrices SPD reste SPD.
+    interpolation :
+        "linear"        : G = Σ w_i G_i (combinaison convexe, SPD) ;
+        "log_euclidean" : G = exp(Σ w_i log G_i), géométrie utilisée par la
+                          stabilité de champ du pipeline de validation
+                          conjonctive.
     """
+    interpolation = _check_interpolation(interpolation)
     X = _validate_points(query_points, "query_points")
     bandwidth = _check_bandwidth(bandwidth)
-    anchors, spd = _prepare_anchor_metrics(anchor_points, anchor_metrics, eig_floor)
+    anchors, spd = _prepare_anchor_metrics(
+        anchor_points, anchor_metrics, eig_floor, interpolation
+    )
 
     if X.shape[1] != anchors.shape[1]:
         raise ValueError(
             "Dimensions incompatibles entre query_points et anchor_points."
         )
-    return _interpolate_prepared(X, anchors, spd, bandwidth, eig_floor)
+    return _interpolate_prepared(
+        X, anchors, spd, bandwidth, eig_floor, interpolation
+    )
 
 
 def interpolate_local_metric(
@@ -665,11 +714,13 @@ def interpolate_local_metric(
     anchor_metrics: np.ndarray,
     bandwidth: float,
     eig_floor: float = 1e-9,
+    interpolation: str = "linear",
 ) -> np.ndarray:
     """Interpole la métrique locale en un seul point (vecteur 1D)."""
     x = _as_finite_array(query_point, "query_point", ndim=1)
     return interpolate_local_metric_batch(
-        x[None, :], anchor_points, anchor_metrics, bandwidth, eig_floor
+        x[None, :], anchor_points, anchor_metrics, bandwidth, eig_floor,
+        interpolation,
     )[0]
 
 
@@ -684,6 +735,7 @@ def path_integrated_distance(
     bandwidth: float,
     n_substeps: int = 20,
     eig_floor: float = 1e-9,
+    interpolation: str = "linear",
 ) -> float:
     """
     Intègre une longueur métrique sur un chemin polygonal (vectorisé).
@@ -696,7 +748,10 @@ def path_integrated_distance(
     path = _validate_points(waypoints, "waypoints", min_points=1)
     n_substeps = _positive_integer(n_substeps, "n_substeps")
     bandwidth = _check_bandwidth(bandwidth)
-    anchors, spd = _prepare_anchor_metrics(anchor_points, anchor_metrics, eig_floor)
+    interpolation = _check_interpolation(interpolation)
+    anchors, spd = _prepare_anchor_metrics(
+        anchor_points, anchor_metrics, eig_floor, interpolation
+    )
 
     if path.shape[1] != anchors.shape[1]:
         raise ValueError(
@@ -704,7 +759,7 @@ def path_integrated_distance(
         )
 
     if path.shape[0] == 1:
-        _interpolate_prepared(path, anchors, spd, bandwidth, eig_floor)
+        _interpolate_prepared(path, anchors, spd, bandwidth, eig_floor, interpolation)
         return 0.0
 
     starts = path[:-1]
@@ -715,7 +770,7 @@ def path_integrated_distance(
         starts[:, None, :] + t_mid[None, :, None] * deltas[:, None, :]
     ).reshape(-1, path.shape[1])
 
-    G = _interpolate_prepared(mids, anchors, spd, bandwidth, eig_floor)
+    G = _interpolate_prepared(mids, anchors, spd, bandwidth, eig_floor, interpolation)
     deltas_rep = np.repeat(deltas, n_substeps, axis=0)
 
     local_sq = np.einsum("mi,mij,mj->m", deltas_rep, G, deltas_rep)
@@ -740,6 +795,7 @@ def local_volume_in_region(
     region_base_volume: float,
     eig_floor: float = 1e-9,
     chunk_size: int = 4096,
+    interpolation: str = "linear",
 ) -> Dict[str, float]:
     """
     Estime un volume transformé par une métrique locale (vectorisé, par blocs).
@@ -753,7 +809,10 @@ def local_volume_in_region(
     samples = _validate_points(region_samples, "region_samples", min_points=1)
     bandwidth = _check_bandwidth(bandwidth)
     chunk_size = _positive_integer(chunk_size, "chunk_size")
-    anchors, spd = _prepare_anchor_metrics(anchor_points, anchor_metrics, eig_floor)
+    interpolation = _check_interpolation(interpolation)
+    anchors, spd = _prepare_anchor_metrics(
+        anchor_points, anchor_metrics, eig_floor, interpolation
+    )
 
     base_volume = float(region_base_volume)
     if not np.isfinite(base_volume) or base_volume <= 0:
@@ -770,7 +829,9 @@ def local_volume_in_region(
 
     for start in range(0, len(samples), chunk_size):
         block = samples[start : start + chunk_size]
-        G = _interpolate_prepared(block, anchors, spd, bandwidth, eig_floor)
+        G = _interpolate_prepared(
+            block, anchors, spd, bandwidth, eig_floor, interpolation
+        )
         sign, logdet = np.linalg.slogdet(G)
 
         if np.any(sign <= 0) or not np.all(np.isfinite(logdet)):
