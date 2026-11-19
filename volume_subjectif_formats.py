@@ -2,27 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Outils pour l'apprentissage d'une métrique subjective de faible rang.
-
-Convention
-----------
-X : matrice d'états          (n_states, n_features)
-D : matrice de dissimilarité (n_states, n_states)
-L : projection latente       (n_features, k)
-W : métrique                 (n_features, n_features)
-
-Distance prédite :
-    d_ij = || (x_i - x_j) @ L ||_2
-
-et
-    W = L @ L.T
+Outils pour l'apprentissage d'une métrique subjective de faible rang
+avec sélection automatique du rang k par validation croisée.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy.optimize import minimize
@@ -32,14 +21,17 @@ __all__ = [
     "upper_tri_pairs",
     "ball_volume_factor",
     "similarity_to_dissimilarity",
-    "fit_from_pairwise_dissimilarity",
     "predict_distances",
+    "fit_from_pairwise_dissimilarity",
+    "select_k_by_cross_validation",
     "SubjectiveMetric",
+    "FitResult",
+    "CVResult",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Utilitaires
+# Utilitaires de base
 # ---------------------------------------------------------------------------
 
 def upper_tri_pairs(n: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -59,7 +51,6 @@ def ball_volume_factor(k: int) -> float:
 
 
 def _validate_square_matrix(matrix: np.ndarray, name: str) -> np.ndarray:
-    """Valide et symétrise une matrice carrée."""
     arr = np.asarray(matrix, dtype=float)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
         raise ValueError(f"{name} doit être une matrice carrée.")
@@ -74,15 +65,7 @@ def similarity_to_dissimilarity(
     min_similarity: float | None = None,
     max_similarity: float | None = None,
 ) -> np.ndarray:
-    """
-    Convertit une matrice de similarité en matrice de dissimilarité.
-
-    Modes
-    -----
-    linear_max   : D = max(S) - S
-    linear_range : D = (max(S) - S) / (max(S) - min(S))   → [0, 1]
-    one_minus    : D = 1 - S
-    """
+    """Convertit une matrice de similarité en dissimilarité."""
     S = _validate_square_matrix(similarity_matrix, "similarity_matrix")
     mode = str(mode).lower()
 
@@ -92,7 +75,7 @@ def similarity_to_dissimilarity(
     if not (np.isfinite(s_min) and np.isfinite(s_max)):
         raise ValueError("Les bornes de similarité doivent être finies.")
     if s_max <= s_min:
-        raise ValueError("max_similarity doit être strictement supérieur à min_similarity.")
+        raise ValueError("max_similarity doit être > min_similarity.")
 
     if mode == "linear_max":
         D = s_max - S
@@ -110,30 +93,17 @@ def similarity_to_dissimilarity(
 
 
 def predict_distances(X: np.ndarray, L: np.ndarray) -> np.ndarray:
-    """
-    Calcule la matrice complète des distances prédites.
-
-    Parameters
-    ----------
-    X : (n, p)
-    L : (p, k)
-
-    Returns
-    -------
-    D_pred : (n, n)
-    """
+    """Matrice complète des distances prédites."""
     X = np.asarray(X, dtype=float)
     L = np.asarray(L, dtype=float)
     latent = X @ L
-    # distances euclidiennes pairwise
     sq = np.sum(latent**2, axis=1, keepdims=True)
-    D2 = sq + sq.T - 2.0 * (latent @ latent.T)
-    D2 = np.maximum(D2, 0.0)
+    D2 = np.maximum(sq + sq.T - 2.0 * (latent @ latent.T), 0.0)
     return np.sqrt(D2)
 
 
 # ---------------------------------------------------------------------------
-# Initialisation MDS classique
+# Initialisation
 # ---------------------------------------------------------------------------
 
 def _classical_mds_initialization(
@@ -142,7 +112,6 @@ def _classical_mds_initialization(
     k: int,
     reg: float,
 ) -> np.ndarray:
-    """Initialise L par MDS classique + régression ridge."""
     n = D.shape[0]
     centering = np.eye(n) - np.ones((n, n)) / n
     gram = -0.5 * centering @ (D ** 2) @ centering
@@ -150,30 +119,25 @@ def _classical_mds_initialization(
 
     eigvals, eigvecs = np.linalg.eigh(gram)
     order = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[order]
-    eigvecs = eigvecs[:, order]
+    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
 
     Z0 = np.zeros((n, k), dtype=float)
     positive = eigvals > 1e-10
     if np.any(positive):
         selected = np.where(positive)[0][:k]
-        Z0[:, : len(selected)] = (
+        Z0[:, :len(selected)] = (
             eigvecs[:, selected] * np.sqrt(np.maximum(eigvals[selected], 0.0))
         )
 
-    xtx = X.T @ X
-    ridge = xtx + max(float(reg), 1e-12) * np.eye(X.shape[1])
-
+    ridge = X.T @ X + max(float(reg), 1e-12) * np.eye(X.shape[1])
     try:
-        L0 = np.linalg.solve(ridge, X.T @ Z0)
+        return np.linalg.solve(ridge, X.T @ Z0)
     except np.linalg.LinAlgError:
-        L0 = np.linalg.pinv(ridge) @ X.T @ Z0
-
-    return L0
+        return np.linalg.pinv(ridge) @ X.T @ Z0
 
 
 # ---------------------------------------------------------------------------
-# Fonction principale d'ajustement
+# Résultats
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -188,6 +152,18 @@ class FitResult:
     penalty: float
 
 
+@dataclass
+class CVResult:
+    best_k: int
+    scores: dict          # k -> mean validation MSE
+    std_scores: dict      # k -> std validation MSE
+    all_fold_scores: dict # k -> list of fold scores
+
+
+# ---------------------------------------------------------------------------
+# Ajustement (avec support de sous-ensemble de paires)
+# ---------------------------------------------------------------------------
+
 def fit_from_pairwise_dissimilarity(
     X_train: np.ndarray,
     D_train: np.ndarray,
@@ -195,33 +171,17 @@ def fit_from_pairwise_dissimilarity(
     reg: float = 1e-2,
     max_iter: int = 2000,
     standardize: bool = False,
+    pair_mask: Optional[np.ndarray] = None,
     return_details: bool = False,
-) -> Tuple[np.ndarray, np.ndarray] | FitResult:
+) -> Union[Tuple[np.ndarray, np.ndarray], FitResult]:
     """
-    Ajuste une métrique de faible rang à partir d'une RDM.
+    Ajuste une métrique de faible rang.
 
     Parameters
     ----------
-    X_train : (n_states, n_features)
-        Matrice d'états. Si standardize=True, elle sera centrée/réduite
-        en interne (moyenne et écart-type sont alors stockés dans le résultat
-        si return_details=True).
-    D_train : (n_states, n_states)
-        Matrice de dissimilarité.
-    k : int
-        Rang latent.
-    reg : float
-        Régularisation ridge sur L.
-    max_iter : int
-        Nombre max d'itérations L-BFGS-B.
-    standardize : bool
-        Si True, standardise X_train (moyenne 0, variance 1) avant l'ajustement.
-    return_details : bool
-        Si True, retourne un objet FitResult riche au lieu de (L, W).
-
-    Returns
-    -------
-    L_hat, W_hat   ou   FitResult
+    pair_mask : array bool de forme (n_pairs,), optionnel
+        Si fourni, n'utilise que les paires True pour l'ajustement
+        (nécessaire pour la validation croisée).
     """
     X = np.asarray(X_train, dtype=float)
     D = _validate_square_matrix(D_train, "D_train")
@@ -231,82 +191,73 @@ def fit_from_pairwise_dissimilarity(
     n_states, n_features = X.shape
 
     if D.shape != (n_states, n_states):
-        raise ValueError("D_train doit avoir la même première dimension que X_train.")
+        raise ValueError("D_train doit correspondre au nombre d'états de X_train.")
 
     k = int(k)
     if not (1 <= k <= n_features):
         raise ValueError(f"k doit être entre 1 et {n_features}.")
     if reg < 0:
         raise ValueError("reg doit être ≥ 0.")
-    if not np.all(np.isfinite(X)):
-        raise ValueError("X_train contient des valeurs non finies.")
-    if np.any(D < -1e-12):
-        raise ValueError("D_train contient des dissimilarités négatives.")
 
     D = np.maximum(D, 0.0)
     np.fill_diagonal(D, 0.0)
 
-    # Standardisation optionnelle
-    mu = np.zeros(n_features)
-    sd = np.ones(n_features)
+    # Standardisation
     if standardize:
         mu = np.mean(X, axis=0)
-        sd = np.std(X, axis=0, ddof=1)
-        sd = np.maximum(sd, 1e-8)
+        sd = np.maximum(np.std(X, axis=0, ddof=1), 1e-8)
         X = (X - mu) / sd
 
-    X_centered = X - np.mean(X, axis=0, keepdims=True)  # pour l'optimisation
+    X_centered = X - np.mean(X, axis=0, keepdims=True)
 
-    i_upper, j_upper = upper_tri_pairs(n_states)
+    i_all, j_all = upper_tri_pairs(n_states)
+    n_pairs = len(i_all)
+
+    if pair_mask is not None:
+        pair_mask = np.asarray(pair_mask, dtype=bool)
+        if pair_mask.shape != (n_pairs,):
+            raise ValueError(f"pair_mask doit être de forme ({n_pairs},)")
+        i_upper = i_all[pair_mask]
+        j_upper = j_all[pair_mask]
+    else:
+        i_upper, j_upper = i_all, j_all
+
     target = D[i_upper, j_upper]
-
     if len(target) == 0:
-        raise ValueError("Il faut au moins une paire d'états.")
+        raise ValueError("Aucune paire disponible pour l'ajustement.")
 
     # Initialisation
-    L0 = _classical_mds_initialization(
-        D=D, X=X_centered, k=k, reg=max(reg, 1e-12)
-    )
+    L0 = _classical_mds_initialization(D, X_centered, k, max(reg, 1e-12))
 
-    def unpack(theta: np.ndarray) -> np.ndarray:
+    def unpack(theta):
         return theta.reshape(n_features, k)
 
-    def objective(theta: np.ndarray) -> float:
+    def objective(theta):
         L = unpack(theta)
         latent = X_centered @ L
         delta = latent[i_upper] - latent[j_upper]
         pred = np.linalg.norm(delta, axis=1)
-        data_loss = float(np.mean((pred - target) ** 2))
-        penalty = float(reg) * float(np.sum(L ** 2))
-        return data_loss + penalty
+        data_loss = np.mean((pred - target) ** 2)
+        penalty = reg * np.sum(L ** 2)
+        return float(data_loss + penalty)
 
     result = minimize(
         objective,
         x0=L0.ravel(),
         method="L-BFGS-B",
-        options={
-            "maxiter": int(max_iter),
-            "ftol": 1e-12,
-            "gtol": 1e-8,
-            "maxls": 50,
-        },
+        options={"maxiter": int(max_iter), "ftol": 1e-12, "gtol": 1e-8, "maxls": 50},
     )
 
     L_hat = unpack(result.x)
-    W_hat = L_hat @ L_hat.T
-    W_hat = 0.5 * (W_hat + W_hat.T)
+    W_hat = 0.5 * (L_hat @ L_hat.T + (L_hat @ L_hat.T).T)
 
-    if not (np.all(np.isfinite(L_hat)) and np.all(np.isfinite(W_hat))):
-        raise RuntimeError("L_hat ou W_hat contient des valeurs non finies.")
-
-    # Calcul final des pertes
-    final_loss = float(result.fun)
-    L_tmp = L_hat
-    latent = X_centered @ L_tmp
+    # Pertes finales
+    latent = X_centered @ L_hat
     delta = latent[i_upper] - latent[j_upper]
     pred = np.linalg.norm(delta, axis=1)
     data_loss = float(np.mean((pred - target) ** 2))
-    penalty = float(reg) * float(np.sum(L_tmp ** 2))
+    penalty = float(reg * np.sum(L_hat ** 2))
+    final_loss = data_loss + penalty
 
     if return_details:
         return FitResult(
@@ -321,15 +272,130 @@ def fit_from_pairwise_dissimilarity(
         )
 
     if not result.success:
-        # On laisse quand même le résultat, mais on avertit
-        import warnings
-        warnings.warn(
-            f"Optimisation non convergée : {result.message}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        warnings.warn(f"Optimisation non convergée : {result.message}", RuntimeWarning)
 
     return L_hat, W_hat
+
+
+# ---------------------------------------------------------------------------
+# Validation croisée pour k
+# ---------------------------------------------------------------------------
+
+def select_k_by_cross_validation(
+    X: np.ndarray,
+    D: np.ndarray,
+    k_candidates: Sequence[int] = (1, 2, 3, 4, 5),
+    n_splits: int = 5,
+    reg: float = 1e-2,
+    standardize: bool = True,
+    max_iter: int = 1500,
+    random_state: int = 42,
+    verbose: bool = True,
+) -> CVResult:
+    """
+    Sélectionne le meilleur rang k par validation croisée sur les paires.
+
+    Stratégie
+    ---------
+    On découpe les paires de la triangulaire supérieure en n_splits folds.
+    Pour chaque k et chaque fold :
+      - on ajuste L uniquement sur les paires d'entraînement
+      - on évalue le MSE des distances sur les paires de validation
+
+    Parameters
+    ----------
+    k_candidates : liste des rangs à tester
+    n_splits     : nombre de folds
+    """
+    X = np.asarray(X, dtype=float)
+    D = _validate_square_matrix(D, "D")
+    n_states = X.shape[0]
+    n_features = X.shape[1]
+
+    i_all, j_all = upper_tri_pairs(n_states)
+    n_pairs = len(i_all)
+
+    if n_pairs < n_splits:
+        raise ValueError(f"Pas assez de paires ({n_pairs}) pour {n_splits} folds.")
+
+    # Filtrage des k valides
+    k_candidates = sorted({int(k) for k in k_candidates if 1 <= int(k) <= n_features})
+    if not k_candidates:
+        raise ValueError("Aucun k valide dans k_candidates.")
+
+    # Génération des folds (mélange des paires)
+    rng = np.random.default_rng(random_state)
+    indices = rng.permutation(n_pairs)
+    fold_sizes = np.full(n_splits, n_pairs // n_splits, dtype=int)
+    fold_sizes[: n_pairs % n_splits] += 1
+
+    folds = []
+    start = 0
+    for size in fold_sizes:
+        folds.append(indices[start : start + size])
+        start += size
+
+    scores = {k: [] for k in k_candidates}
+
+    for fold_idx, val_idx in enumerate(folds):
+        train_mask = np.ones(n_pairs, dtype=bool)
+        train_mask[val_idx] = False
+        val_mask = \~train_mask
+
+        # Préparation des indices de validation
+        i_val = i_all[val_mask]
+        j_val = j_all[val_mask]
+        target_val = D[i_val, j_val]
+
+        for k in k_candidates:
+            # Ajustement sur les paires d'entraînement uniquement
+            L_hat, _ = fit_from_pairwise_dissimilarity(
+                X,
+                D,
+                k=k,
+                reg=reg,
+                max_iter=max_iter,
+                standardize=standardize,
+                pair_mask=train_mask,
+                return_details=False,
+            )
+
+            # Évaluation sur les paires de validation
+            if standardize:
+                mu = np.mean(X, axis=0)
+                sd = np.maximum(np.std(X, axis=0, ddof=1), 1e-8)
+                X_proc = (X - mu) / sd
+            else:
+                X_proc = X
+
+            X_cent = X_proc - np.mean(X_proc, axis=0, keepdims=True)
+            latent = X_cent @ L_hat
+            delta = latent[i_val] - latent[j_val]
+            pred = np.linalg.norm(delta, axis=1)
+            mse = float(np.mean((pred - target_val) ** 2))
+            scores[k].append(mse)
+
+        if verbose:
+            print(f"Fold {fold_idx + 1}/{n_splits} terminé.")
+
+    # Agrégation
+    mean_scores = {k: float(np.mean(v)) for k, v in scores.items()}
+    std_scores = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in scores.items()}
+
+    best_k = min(mean_scores, key=mean_scores.get)
+
+    if verbose:
+        print("\nRésultats de la validation croisée (MSE validation) :")
+        for k in k_candidates:
+            print(f"  k = {k:2d}  →  {mean_scores[k]:.6f}  ±  {std_scores[k]:.6f}")
+        print(f"\nMeilleur k sélectionné : {best_k}")
+
+    return CVResult(
+        best_k=best_k,
+        scores=mean_scores,
+        std_scores=std_scores,
+        all_fold_scores=scores,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,23 +404,77 @@ def fit_from_pairwise_dissimilarity(
 
 class SubjectiveMetric:
     """
-    Interface orientée objet pour l'apprentissage et l'utilisation
-    d'une métrique subjective de faible rang.
+    Apprentissage d'une métrique subjective de faible rang
+    avec sélection automatique de k par validation croisée.
     """
 
-    def __init__(self, k: int = 2, reg: float = 1e-2, standardize: bool = True):
-        self.k = int(k)
+    def __init__(
+        self,
+        k: Optional[int] = None,
+        reg: float = 1e-2,
+        standardize: bool = True,
+        k_candidates: Sequence[int] = (1, 2, 3, 4, 5),
+        n_splits: int = 5,
+    ):
+        self.k = k
         self.reg = float(reg)
         self.standardize = bool(standardize)
+        self.k_candidates = list(k_candidates)
+        self.n_splits = int(n_splits)
+
         self.L_: Optional[np.ndarray] = None
         self.W_: Optional[np.ndarray] = None
         self.mu_: Optional[np.ndarray] = None
         self.sd_: Optional[np.ndarray] = None
         self.fit_result_: Optional[FitResult] = None
+        self.cv_result_: Optional[CVResult] = None
 
-    def fit(self, X: np.ndarray, D: np.ndarray) -> "SubjectiveMetric":
-        """Ajuste la métrique."""
+    def select_k(
+        self,
+        X: np.ndarray,
+        D: np.ndarray,
+        k_candidates: Optional[Sequence[int]] = None,
+        n_splits: Optional[int] = None,
+        random_state: int = 42,
+        verbose: bool = True,
+    ) -> int:
+        """Lance la validation croisée et stocke le meilleur k."""
+        candidates = k_candidates if k_candidates is not None else self.k_candidates
+        splits = n_splits if n_splits is not None else self.n_splits
+
+        self.cv_result_ = select_k_by_cross_validation(
+            X,
+            D,
+            k_candidates=candidates,
+            n_splits=splits,
+            reg=self.reg,
+            standardize=self.standardize,
+            random_state=random_state,
+            verbose=verbose,
+        )
+        self.k = self.cv_result_.best_k
+        return self.k
+
+    def fit(self, X: np.ndarray, D: np.ndarray, select_k: bool = False) -> "SubjectiveMetric":
+        """
+        Ajuste la métrique.
+
+        Si select_k=True et que self.k est None, lance automatiquement
+        la validation croisée avant l'ajustement final.
+        """
         X = np.asarray(X, dtype=float)
+
+        if select_k or self.k is None:
+            if self.k is None:
+                self.select_k(X, D, verbose=True)
+            else:
+                # on force quand même une CV si demandé
+                self.select_k(X, D, verbose=True)
+
+        if self.k is None:
+            raise RuntimeError("k n'est pas défini. Appelez select_k() ou passez k à l'init.")
+
+        # Standardisation
         if self.standardize:
             self.mu_ = np.mean(X, axis=0)
             self.sd_ = np.maximum(np.std(X, axis=0, ddof=1), 1e-8)
@@ -369,24 +489,22 @@ class SubjectiveMetric:
             D,
             k=self.k,
             reg=self.reg,
-            standardize=False,          # déjà fait
+            standardize=False,
             return_details=True,
         )
         assert isinstance(result, FitResult)
+
         self.L_ = result.L
         self.W_ = result.W
         self.fit_result_ = result
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        """Projette les états dans l'espace latent."""
         self._check_is_fitted()
         X = np.asarray(X, dtype=float)
-        X_proc = (X - self.mu_) / self.sd_
-        return X_proc @ self.L_
+        return ((X - self.mu_) / self.sd_) @ self.L_
 
     def pairwise_distances(self, X: np.ndarray) -> np.ndarray:
-        """Matrice des distances prédites."""
         self._check_is_fitted()
         X = np.asarray(X, dtype=float)
         X_proc = (X - self.mu_) / self.sd_
@@ -394,7 +512,7 @@ class SubjectiveMetric:
 
     def _check_is_fitted(self) -> None:
         if self.L_ is None:
-            raise RuntimeError("L'estimateur n'a pas encore été ajusté. Appelez fit().")
+            raise RuntimeError("L'estimateur n'est pas encore ajusté. Appelez fit().")
 
 
 # ---------------------------------------------------------------------------
@@ -404,50 +522,37 @@ class SubjectiveMetric:
 if __name__ == "__main__":
     rng = np.random.default_rng(2026)
 
-    n_states = 20
-    n_features = 7
-    k_rank = 2
-
+    n_states, n_features, k_true = 30, 8, 3
     X = rng.standard_normal((n_states, n_features))
 
-    L_true = np.zeros((n_features, k_rank))
-    L_true[0, 0] = 1.2
-    L_true[2, 0] = -0.8
-    L_true[4, 1] = 1.0
-    L_true[6, 1] = 0.7
+    L_true = np.zeros((n_features, k_true))
+    L_true[0, 0] = 1.4
+    L_true[2, 0] = -0.9
+    L_true[1, 1] = 1.1
+    L_true[4, 1] = 0.7
+    L_true[3, 2] = 1.0
+    L_true[6, 2] = -0.6
 
-    i_upper, j_upper = upper_tri_pairs(n_states)
-    differences = (X[i_upper] - X[j_upper]) @ L_true
-    d_true = np.linalg.norm(differences, axis=1)
+    i_u, j_u = upper_tri_pairs(n_states)
+    d_true = np.linalg.norm((X[i_u] - X[j_u]) @ L_true, axis=1)
 
     similarity = np.zeros((n_states, n_states))
-    similarity[i_upper, j_upper] = 7.0 - d_true
-    similarity[j_upper, i_upper] = 7.0 - d_true
+    similarity[i_u, j_u] = similarity[j_u, i_u] = 7.0 - d_true
     np.fill_diagonal(similarity, 7.0)
 
-    D = similarity_to_dissimilarity(
-        similarity,
-        mode="linear_max",
-        min_similarity=1.0,
-        max_similarity=7.0,
+    D = similarity_to_dissimilarity(similarity, mode="linear_max", min_similarity=1.0, max_similarity=7.0)
+
+    print("=== Sélection de k par validation croisée ===")
+    metric = SubjectiveMetric(
+        k=None,                    # on laisse la CV choisir
+        reg=1e-2,
+        standardize=True,
+        k_candidates=[1, 2, 3, 4, 5],
+        n_splits=5,
     )
+    metric.fit(X, D, select_k=True)
 
-    # Version fonctionnelle
-    L_hat, W_hat = fit_from_pairwise_dissimilarity(
-        X, D, k=k_rank, reg=1e-2, standardize=True
-    )
-
-    print("=== Version fonctionnelle ===")
-    print("L_hat shape :", L_hat.shape)
-    print("W_hat shape :", W_hat.shape)
-    print("Rang de W   :", np.linalg.matrix_rank(W_hat, tol=1e-8))
-
-    # Version orientée objet
-    metric = SubjectiveMetric(k=k_rank, reg=1e-2, standardize=True)
-    metric.fit(X, D)
-
-    print("\n=== Version orientée objet ===")
-    print("Succès       :", metric.fit_result_.success)
-    print("Itérations   :", metric.fit_result_.n_iter)
-    print("Loss finale  :", f"{metric.fit_result_.final_loss:.6f}")
-    print("Distances prédites shape :", metric.pairwise_distances(X).shape)
+    print(f"\nRang sélectionné : {metric.k}")
+    print(f"Succès optimisation finale : {metric.fit_result_.success}")
+    print(f"Loss finale : {metric.fit_result_.final_loss:.6f}")
+    print(f"Shape de L  : {metric.L_.shape}")
