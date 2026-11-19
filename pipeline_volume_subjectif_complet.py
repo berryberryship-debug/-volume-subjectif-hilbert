@@ -17,6 +17,10 @@ Pipeline complet de calibration et d'estimation des volumes subjectifs.
 9. export atomique JSON et CSV.
 
 Les données-ponts ne sont jamais utilisées pour ajuster W_theta.
+
+Compatibilité : ce fichier cible l'API actuelle de
+local_jnd_bridge_calibration (source_coords / target_coords, thresholds,
+fit_intercept, apply_procrustes_transform exportée par le module).
 """
 
 from __future__ import annotations
@@ -35,11 +39,12 @@ from scipy.spatial.distance import pdist, squareform
 from local_jnd_bridge_calibration import (
     apply_linear_scale,
     apply_monotone_binned,
+    apply_procrustes_transform,
     evaluate_calibration_split,
     fit_linear_scale,
     fit_local_metric_at_anchor,
     fit_monotone_binned,
-    interpolate_local_metric,
+    interpolate_local_metric_batch,
     path_integrated_distance,
     procrustes_align_bridges,
 )
@@ -133,8 +138,12 @@ def project_states(
     """
     Projette les états dans l'espace latent.
 
-    Si center_states=True, le centre propre au jeu d'états fourni est retiré.
-    Le volume obtenu mesure alors principalement la dispersion interne.
+    Si center_states=True, le centre propre au jeu d'états fourni est retiré
+    (centrage PAR CONDITION). Le volume obtenu mesure alors principalement la
+    dispersion interne.
+
+    Si center_states=False, seul le scaler d'entraînement est appliqué : le
+    centre est alors COMMUN à toutes les conditions.
     """
     X_std = apply_unified_scaler(
         X,
@@ -168,68 +177,6 @@ def project_states(
         )
 
     return X_std @ L_hat
-
-
-def apply_procrustes_transform(
-    new_coords: np.ndarray,
-    procrustes_fit: Dict[str, object],
-) -> np.ndarray:
-    """
-    Applique une transformation Procrustes déjà estimée.
-    """
-    pts = np.asarray(
-        new_coords,
-        dtype=float,
-    )
-
-    if pts.ndim != 2:
-        raise ValueError(
-            "new_coords doit être une matrice 2D."
-        )
-
-    mu_src = np.asarray(
-        procrustes_fit["translation_source"],
-        dtype=float,
-    )
-
-    mu_tgt = np.asarray(
-        procrustes_fit["translation_target"],
-        dtype=float,
-    )
-
-    rotation = np.asarray(
-        procrustes_fit["rotation_matrix"],
-        dtype=float,
-    )
-
-    scale = float(
-        procrustes_fit["scale_factor"]
-    )
-
-    if pts.shape[1] != len(mu_src):
-        raise ValueError(
-            "La dimension de new_coords ne correspond pas "
-            "à la transformation Procrustes."
-        )
-
-    d_rotation = rotation.shape[0]
-
-    pts_pad = np.zeros(
-        (len(pts), d_rotation),
-        dtype=float,
-    )
-
-    pts_pad[:, :pts.shape[1]] = (
-        pts - mu_src[None, :]
-    )
-
-    aligned = scale * (
-        pts_pad @ rotation
-    )
-
-    aligned[:, :len(mu_tgt)] += mu_tgt[None, :]
-
-    return aligned[:, :len(mu_tgt)]
 
 
 def _apply_scalar_scale_about_center(
@@ -406,6 +353,36 @@ def sample_uniform_in_ellipsoid(
     )
 
 
+def _sqrt_det_densities(
+    points: np.ndarray,
+    anchor_points: np.ndarray,
+    anchor_metrics: np.ndarray,
+    bandwidth: float,
+) -> np.ndarray:
+    """
+    Densités sqrt(det G(x)) en un lot de points (interpolation vectorisée).
+    """
+    G = interpolate_local_metric_batch(
+        points,
+        anchor_points,
+        anchor_metrics,
+        bandwidth=bandwidth,
+    )
+
+    sign_det, log_det = np.linalg.slogdet(
+        G
+    )
+
+    if np.any(sign_det <= 0.0) or not np.all(np.isfinite(log_det)):
+        raise RuntimeError(
+            "La métrique locale n'est pas SPD."
+        )
+
+    return np.exp(
+        0.5 * log_det
+    )
+
+
 def compute_calibrated_subjective_volume(
     X_condition: np.ndarray,
     L_hat: np.ndarray,
@@ -418,6 +395,7 @@ def compute_calibrated_subjective_volume(
     eig_floor: float = 1e-10,
     seed: int = 42,
     unit_ball_points: Optional[np.ndarray] = None,
+    center_states: bool = True,
 ):
     """
     Estime :
@@ -430,13 +408,18 @@ def compute_calibrated_subjective_volume(
 
     L'échantillonnage est uniforme dans l'ellipsoïde estimé par la
     covariance des états projetés.
+
+    center_states=True  : centrage par condition (comportement historique).
+    center_states=False : centre commun (scaler d'entraînement seul) ; G(x)
+                          est alors évalué à la position réelle de la
+                          condition.
     """
     Z = project_states(
         X_condition,
         mu_train,
         sd_train,
         L_hat,
-        center_states=True,
+        center_states=center_states,
     )
 
     n_states, dimension = Z.shape
@@ -492,31 +475,12 @@ def compute_calibrated_subjective_volume(
         )
     )
 
-    densities = np.empty(
-        len(samples),
-        dtype=float,
+    densities = _sqrt_det_densities(
+        samples,
+        anchor_points,
+        anchor_metrics,
+        bandwidth,
     )
-
-    for idx, point in enumerate(samples):
-        G_point = interpolate_local_metric(
-            point,
-            anchor_points,
-            anchor_metrics,
-            bandwidth=bandwidth,
-        )
-
-        sign_det, log_det = np.linalg.slogdet(
-            G_point
-        )
-
-        if sign_det <= 0.0 or not np.isfinite(log_det):
-            raise RuntimeError(
-                "La métrique locale n'est pas SPD."
-            )
-
-        densities[idx] = math.exp(
-            0.5 * log_det
-        )
 
     mean_density = float(
         np.mean(densities)
@@ -596,28 +560,12 @@ def compute_reference_global_density(
             "reference_points doit être une matrice non vide."
         )
 
-    densities = []
-
-    for point in points:
-        G_point = interpolate_local_metric(
-            point,
-            anchor_points,
-            anchor_metrics,
-            bandwidth=bandwidth,
-        )
-
-        sign_det, log_det = np.linalg.slogdet(
-            G_point
-        )
-
-        if sign_det <= 0.0 or not np.isfinite(log_det):
-            raise RuntimeError(
-                "Métrique locale non SPD dans la référence globale."
-            )
-
-        densities.append(
-            math.exp(0.5 * log_det)
-        )
+    densities = _sqrt_det_densities(
+        points,
+        anchor_points,
+        anchor_metrics,
+        bandwidth,
+    )
 
     g_bar = max(
         float(np.mean(densities)),
@@ -657,6 +605,7 @@ def compare_global_vs_local_volume(
     eig_floor: float = 1e-10,
     seed: int = 42,
     unit_ball_points: Optional[np.ndarray] = None,
+    center_states: bool = True,
 ):
     """
     Compare :
@@ -676,6 +625,7 @@ def compare_global_vs_local_volume(
         eig_floor=eig_floor,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
     )
 
     global_density = float(
@@ -757,6 +707,26 @@ def _pairs_strictly_within_nodes(
     return pairs
 
 
+def _non_equivalence_warning(
+    metrics: Dict[str, object],
+) -> bool:
+    """
+    Alerte opérationnelle (pas un test d'équivalence formel).
+
+    Pente et Spearman valent None lorsqu'ils ne sont pas définis ; ce cas
+    déclenche l'alerte.
+    """
+    slope = metrics.get("slope_pred_vs_ref")
+    rho = metrics.get("spearman")
+
+    return bool(
+        slope is None
+        or abs(slope - 1.0) > 0.25
+        or rho is None
+        or rho < 0.50
+    )
+
+
 def calibrate_bridges_by_node_split(
     spatial_coords_bridges: np.ndarray,
     ref_coords_bridges: np.ndarray,
@@ -834,14 +804,16 @@ def calibrate_bridges_by_node_split(
             "Au moins trois nœuds sont nécessaires pour l'alignement."
         )
 
+    # Échelle fixée à 1 ici : elle est calibrée ensuite sur les distances.
     procrustes_fit = procrustes_align_bridges(
-        coords_source=source[cal_ids],
-        coords_target=reference[cal_ids],
+        source_coords=source[cal_ids],
+        target_coords=reference[cal_ids],
         allow_reflection=allow_reflection,
         estimate_scale=False,
         return_raw_distances=False,
     )
 
+    # Transformation figée, appliquée à tous les ponts sans réestimation.
     aligned_without_scale = apply_procrustes_transform(
         source,
         procrustes_fit,
@@ -902,7 +874,7 @@ def calibrate_bridges_by_node_split(
     linear_model = fit_linear_scale(
         d_cal_raw,
         d_cal_ref,
-        fix_intercept_zero=True,
+        fit_intercept=False,
     )
 
     monotone_model = fit_monotone_binned(
@@ -991,15 +963,8 @@ def calibrate_bridges_by_node_split(
         coordinate_scale,
     )
 
-    non_equivalence_warning = bool(
-        abs(
-            selected_test_metrics[
-                "slope_pred_vs_ref"
-            ] - 1.0
-        ) > 0.25
-        or selected_test_metrics[
-            "spearman"
-        ] < 0.50
+    non_equivalence_warning = _non_equivalence_warning(
+        selected_test_metrics
     )
 
     return {
@@ -1079,6 +1044,7 @@ def _compute_condition_volume_from_labels(
     unit_ball_points: np.ndarray,
     eig_floor: float,
     seed: int,
+    center_states: bool = True,
 ):
     """
     Calcule les volumes A et B à partir d'étiquettes permutées.
@@ -1100,6 +1066,7 @@ def _compute_condition_volume_from_labels(
         eig_floor=eig_floor,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
     )
 
     result_b = compute_calibrated_subjective_volume(
@@ -1113,6 +1080,7 @@ def _compute_condition_volume_from_labels(
         eig_floor=eig_floor,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
     )
 
     delta_volume = (
@@ -1146,6 +1114,7 @@ def permutation_test_conditions(
     pair_ids: Optional[Sequence] = None,
     strata: Optional[Sequence] = None,
     seed: int = 42,
+    center_states: bool = True,
 ):
     """
     Test de permutation bilatéral sur :
@@ -1161,7 +1130,8 @@ def permutation_test_conditions(
     de chaque strate.
 
     Les mêmes points Monte-Carlo de la boule unité sont réutilisés pour
-    toutes les permutations.
+    toutes les permutations. `center_states` s'applique de façon identique
+    aux volumes observés et permutés.
     """
     A = np.asarray(
         X_cond_A,
@@ -1217,6 +1187,7 @@ def permutation_test_conditions(
         eig_floor=eig_floor,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
     )
 
     observed_b = compute_calibrated_subjective_volume(
@@ -1230,6 +1201,7 @@ def permutation_test_conditions(
         eig_floor=eig_floor,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
     )
 
     observed_delta_volume = (
@@ -1283,6 +1255,13 @@ def permutation_test_conditions(
     null_delta_volume = []
     null_delta_deff = []
 
+    if pair_groups is not None:
+        design = "paired_within_pair_swap"
+    elif strata_array is not None:
+        design = "stratified"
+    else:
+        design = "unpaired"
+
     for permutation_index in range(
         int(n_perm)
     ):
@@ -1301,8 +1280,6 @@ def permutation_test_conditions(
                         permuted_labels[first],
                     )
 
-            design = "paired_within_pair_swap"
-
         elif strata_array is not None:
             permuted_labels = base_labels.copy()
 
@@ -1317,14 +1294,10 @@ def permutation_test_conditions(
                     base_labels[indices]
                 )
 
-            design = "stratified"
-
         else:
             permuted_labels = rng.permutation(
                 base_labels
             )
-
-            design = "unpaired"
 
         null_result = _compute_condition_volume_from_labels(
             pooled=pooled,
@@ -1338,6 +1311,7 @@ def permutation_test_conditions(
             unit_ball_points=unit_ball_points,
             eig_floor=eig_floor,
             seed=seed,
+            center_states=center_states,
         )
 
         if null_result is None:
@@ -1443,6 +1417,7 @@ def permutation_test_conditions(
 
     return {
         "design": design,
+        "center_states": bool(center_states),
         "n_permutations_requested": int(n_perm),
         "n_permutations_valid": int(n_valid),
         "delta_volume_B_minus_A": float(
@@ -1638,6 +1613,7 @@ def export_pipeline_results(
                         "n_perm": metadata.get("n_perm"),
                         "k_rank": metadata.get("k_rank"),
                         "bandwidth": metadata.get("bandwidth"),
+                        "center_states": metadata.get("center_states"),
                         "V_k_raw_space": condition_data.get(
                             "V_k_raw_space"
                         ),
@@ -1788,9 +1764,13 @@ def run_full_demonstration(
     n_mc_samples: int = 400,
     export_json_path: Optional[str] = None,
     export_csv_path: Optional[str] = None,
+    center_states: bool = True,
 ):
     """
     Exécute une démonstration complète sur données simulées.
+
+    center_states=True reproduit le comportement historique (centrage par
+    condition) ; False utilise un centre commun.
     """
     rng = np.random.default_rng(
         int(seed)
@@ -1940,7 +1920,7 @@ def run_full_demonstration(
 
         G_local = fit_local_metric_at_anchor(
             displacements=displacements,
-            jnd_thresholds=jnds,
+            thresholds=jnds,
             G_prior=G_prior,
             shrink_lambda=0.25,
             reg=1e-3,
@@ -2084,8 +2064,7 @@ def run_full_demonstration(
         ]
     )
 
-    volume_a = compute_calibrated_subjective_volume(
-        X_condition=X_condition_a,
+    volume_kwargs = dict(
         L_hat=L_hat,
         mu_train=mu_train,
         sd_train=sd_train,
@@ -2095,47 +2074,29 @@ def run_full_demonstration(
         n_mc_samples=n_mc_samples,
         seed=seed,
         unit_ball_points=unit_ball_points,
+        center_states=center_states,
+    )
+
+    volume_a = compute_calibrated_subjective_volume(
+        X_condition=X_condition_a,
+        **volume_kwargs,
     )
 
     volume_b = compute_calibrated_subjective_volume(
         X_condition=X_condition_b,
-        L_hat=L_hat,
-        mu_train=mu_train,
-        sd_train=sd_train,
-        anchor_points=anchor_points,
-        anchor_metrics=anchor_metrics,
-        bandwidth=bandwidth,
-        n_mc_samples=n_mc_samples,
-        seed=seed,
-        unit_ball_points=unit_ball_points,
+        **volume_kwargs,
     )
 
     comparison_a = compare_global_vs_local_volume(
         X_condition=X_condition_a,
-        L_hat=L_hat,
-        mu_train=mu_train,
-        sd_train=sd_train,
-        anchor_points=anchor_points,
-        anchor_metrics=anchor_metrics,
         reference_density_info=reference_density,
-        bandwidth=bandwidth,
-        n_mc_samples=n_mc_samples,
-        seed=seed,
-        unit_ball_points=unit_ball_points,
+        **volume_kwargs,
     )
 
     comparison_b = compare_global_vs_local_volume(
         X_condition=X_condition_b,
-        L_hat=L_hat,
-        mu_train=mu_train,
-        sd_train=sd_train,
-        anchor_points=anchor_points,
-        anchor_metrics=anchor_metrics,
         reference_density_info=reference_density,
-        bandwidth=bandwidth,
-        n_mc_samples=n_mc_samples,
-        seed=seed,
-        unit_ball_points=unit_ball_points,
+        **volume_kwargs,
     )
 
     # ------------------------------------------------------------------
@@ -2196,6 +2157,7 @@ def run_full_demonstration(
         n_perm=n_perm,
         pair_ids=pair_ids,
         seed=seed,
+        center_states=center_states,
     )
 
     # ------------------------------------------------------------------
@@ -2220,6 +2182,7 @@ def run_full_demonstration(
             "k_rank": int(k_rank),
             "bandwidth": float(bandwidth),
             "scaler_ddof": int(scaler_ddof),
+            "center_states": bool(center_states),
             "bridge_calibration_ids": cal_ids,
             "bridge_validation_ids": val_ids,
             "bridge_test_ids": test_ids,
@@ -2237,7 +2200,7 @@ def run_full_demonstration(
             ],
             "procrustes_disparity": bridge_calibration[
                 "procrustes_fit"
-            ]["procrustes_disparity"],
+            ]["disparity"],
             "test_metrics": bridge_calibration[
                 "test_metrics"
             ],
@@ -2297,4 +2260,4 @@ if __name__ == "__main__":
         n_mc_samples=400,
         export_json_path="resultats_volume_subjectif.json",
         export_csv_path="resultats_volume_subjectif.csv",
-  )
+    )
