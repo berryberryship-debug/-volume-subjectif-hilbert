@@ -2,50 +2,66 @@
 quality_controls.py
 
 Contrôles de cohérence minimaux sur D_subj avant calibration.
+
 L'inégalité triangulaire est un DIAGNOSTIC, pas une exigence :
 une dissimilarité empirique peut ne pas être métrique stricte.
 """
 
 from __future__ import annotations
+
 import numpy as np
+
+__all__ = ["check_D_subj"]
 
 
 def check_D_subj(D, *, name="D_subj", tol_sym=1e-6, tol_tri=1e-6):
+    """Vérifie la cohérence de D_subj et retourne un rapport.
+
+    Lève ValueError sur les violations bloquantes (carré, fini, diagonale
+    nulle, symétrie, positivité). Retourne un rapport incluant le
+    diagnostic de l'inégalité triangulaire, qui ne bloque pas l'analyse.
+    """
     D = np.asarray(D, dtype=float)
-    report = {}
 
-    assert D.ndim == 2 and D.shape[0] == D.shape[1], f"{name} doit être carrée"
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError(f"{name} doit être une matrice carrée ; reçu shape={D.shape}")
     n = D.shape[0]
-    report["n"] = n
 
-    assert np.isfinite(D).all(), f"{name} contient des valeurs non finies"
+    if not np.isfinite(D).all():
+        raise ValueError(f"{name} contient des valeurs non finies")
 
-    report["diag_max_abs"] = float(np.max(np.abs(np.diag(D))))
-    assert report["diag_max_abs"] <= tol_sym, f"{name} : diagonale non nulle"
+    diag_max = float(np.max(np.abs(np.diag(D))))
+    if diag_max > tol_sym:
+        raise ValueError(f"{name} : diagonale non nulle (max={diag_max})")
 
-    report["asymmetry_max"] = float(np.max(np.abs(D - D.T)))
-    assert report["asymmetry_max"] <= tol_sym, f"{name} : non symétrique"
+    asym = float(np.max(np.abs(D - D.T)))
+    if asym > tol_sym:
+        raise ValueError(f"{name} : matrice non symétrique (max asym={asym})")
 
-    report["min_value"] = float(D.min())
-    assert report["min_value"] >= -tol_sym, f"{name} : valeurs négatives"
+    dmin = float(D.min())
+    if dmin < -tol_sym:
+        raise ValueError(f"{name} : valeurs négatives (min={dmin})")
 
-    # doublons potentiels (points confondus), diagnostic
-    zero_off = (np.abs(D) < 1e-12) & ~np.eye(n, dtype=bool)
-    report["n_zero_offdiag_pairs"] = int(zero_off.sum() // 2)
+    off = ~np.eye(n, dtype=bool)
+    n_zero = int(((np.abs(D) < 1e-12) & off).sum() // 2)
 
-    # inégalité triangulaire — diagnostic
-    tri_viol, tri_worst = 0, 0.0
+    scale = float(D.max()) + 1e-12
+    worst = 0.0
+    n_viol = 0
     for i in range(n):
-        lhs = D[i, :][None, :]
-        rhs = D[i, :][:, None] + D
-        viol = (lhs - rhs) / (D.max() + 1e-12)
-        tri_worst = max(tri_worst, float(viol.max()))
-        tri_viol += int((viol > tol_tri).sum())
-    report["tri_violations_frac"] = tri_viol / (n ** 3)
-    report["tri_worst_relative"] = tri_worst
-    if tri_viol > 0:
-        report["warning"] = (
-            "Inégalité triangulaire non respectée : D_subj n'est pas "
-            "métrique stricte. Diagnostic seulement, ne bloque pas l'analyse."
-        )
-    return report
+        viol = (D[i, :][None, :] - (D[i, :][:, None] + D)) / scale
+        m = float(viol.max())
+        if m > worst:
+            worst = m
+        n_viol += int((viol > tol_tri).sum())
+
+    return {
+        "n": n,
+        "diag_max_abs": diag_max,
+        "asymmetry_max": asym,
+        "min_value": dmin,
+        "n_zero_offdiag_pairs": n_zero,
+        "tri_violations_frac": n_viol / (n ** 3),
+        "tri_worst_relative": worst,
+        "tri_is_diagnostic_only": True,
+    }
