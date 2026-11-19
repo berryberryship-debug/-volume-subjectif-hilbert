@@ -430,6 +430,19 @@ La distinction fondamentale reste :
 
 Chaque transition doit être documentée par une opération explicite et ne peut être remplacée par une analogie sémantique.
 
+volume-subjectif/
+├── local_jnd_bridge_calibration.py
+├── volume_subjectif_formats.py
+├── pipeline_volume_subjectif_complet.py
+├── conjunctive_validation_and_power.py
+├── nested_model_and_eeg_rsa.py
+├── models/
+│   ├── vacuite_holotelegraphique_unifie.py
+│   └── v95_skyrme_soliton.py
+├── REGISTRE_REVENDICATIONS.md
+├── README.md
+└── LICENSE
+
 ## Licence
 
 Le dépôt est distribué sous licence MIT. Voir le fichier `LICENSE`.
