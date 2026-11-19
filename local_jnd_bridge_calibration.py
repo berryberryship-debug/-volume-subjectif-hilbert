@@ -39,13 +39,26 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Dict, Optional
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import spearmanr
 
+__version__ = "1.1.0"
 
 __all__ = [
     "apply_linear_scale",
@@ -62,18 +75,65 @@ __all__ = [
     "apply_procrustes_transform",
     "calibrate_and_validate_bridges",
     "to_jsonable",
+    "__version__",
 ]
+
+# ---------------------------------------------------------------------------
+# Constantes (seuils opérationnels et numériques)
+# ---------------------------------------------------------------------------
+
+_CENTERING_MODES = ("common", "per_condition")
+_INTERPOLATIONS = ("linear", "log_euclidean")
+
+# Seuils d'alerte pour la calibration (non statistiques formels)
+_SLOPE_TOLERANCE = 0.25
+_MIN_SPEARMAN = 0.50
+
+# Numérique
+_DEFAULT_EIG_FLOOR = 1e-9
+_DEFAULT_SHRINK_LAMBDA = 0.1
+_DEFAULT_REG = 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Types structurés (documentation + autocomplétion)
+# ---------------------------------------------------------------------------
+
+CenteringMode = Literal["common", "per_condition"]
+InterpolationMode = Literal["linear", "log_euclidean"]
+
+
+class LinearScaleModel(TypedDict):
+    a: float
+    b: float
+
+
+class MonotoneModel(TypedDict, total=False):
+    type: Literal["monotone_constant", "monotone_piecewise"]
+    edges: NDArray[np.floating]
+    centers: NDArray[np.floating]
+    values: NDArray[np.floating]
+    weights: NDArray[np.floating]
+
+
+class CalibrationMetrics(TypedDict):
+    n: int
+    mae: float
+    rmse: float
+    slope_pred_vs_ref: Optional[float]
+    spearman: Optional[float]
 
 
 # ============================================================================
 # 1. VALIDATION NUMÉRIQUE
 # ============================================================================
 
+
 def _as_finite_array(
-    values: Any,
+    values: ArrayLike,
     name: str,
     ndim: Optional[int] = None,
-) -> np.ndarray:
+) -> NDArray[np.floating]:
     """Convertit une entrée en tableau float fini."""
     try:
         array = np.asarray(values, dtype=float)
@@ -84,7 +144,7 @@ def _as_finite_array(
 
     if ndim is not None and array.ndim != ndim:
         raise ValueError(
-            f"{name} doit avoir {ndim} dimensions ; "
+            f"{name} doit avoir {ndim} dimension(s) ; "
             f"dimensions reçues : {array.ndim}."
         )
 
@@ -94,7 +154,7 @@ def _as_finite_array(
     return array
 
 
-def _validate_nonnegative(values: Any, name: str) -> np.ndarray:
+def _validate_nonnegative(values: ArrayLike, name: str) -> NDArray[np.floating]:
     array = _as_finite_array(values, name)
     if np.any(array < 0):
         raise ValueError(
@@ -103,7 +163,11 @@ def _validate_nonnegative(values: Any, name: str) -> np.ndarray:
     return array
 
 
-def _validate_points(values: Any, name: str, min_points: int = 1) -> np.ndarray:
+def _validate_points(
+    values: ArrayLike,
+    name: str,
+    min_points: int = 1,
+) -> NDArray[np.floating]:
     points = _as_finite_array(values, name, ndim=2)
     if points.shape[0] < min_points:
         raise ValueError(f"{name} doit contenir au moins {min_points} point(s).")
@@ -122,7 +186,10 @@ def _positive_integer(value: Any, name: str) -> int:
     return int(value)
 
 
-def _ensure_spd(matrix: np.ndarray, eig_floor: float = 1e-9) -> np.ndarray:
+def _ensure_spd(
+    matrix: ArrayLike,
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
+) -> NDArray[np.floating]:
     """
     Symétrise et régularise une matrice (ou un lot de matrices, forme
     (..., d, d)) pour obtenir des matrices SPD.
@@ -156,9 +223,11 @@ def to_jsonable(obj: Any) -> Any:
         return obj.tolist()
     if isinstance(obj, np.generic):
         return obj.item()
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, set):
         return [to_jsonable(v) for v in obj]
     return obj
 
@@ -185,19 +254,21 @@ def to_jsonable(obj: Any) -> Any:
 # appliquée sans réestimation (apply_procrustes_transform) aux états de
 # validation et de test.
 
-_CENTERING_MODES = ("common", "per_condition")
 
-
-def _check_centering_mode(centering_mode: Any) -> str:
+def _check_centering_mode(centering_mode: Any) -> CenteringMode:
     if centering_mode not in _CENTERING_MODES:
         raise ValueError(
             f"centering_mode doit appartenir à {_CENTERING_MODES} ; "
             f"valeur reçue : {centering_mode!r}."
         )
-    return str(centering_mode)
+    return str(centering_mode)  # type: ignore[return-value]
 
 
-def _prepare_condition_labels(labels: Any, n_points: int, name: str) -> np.ndarray:
+def _prepare_condition_labels(
+    labels: ArrayLike,
+    n_points: int,
+    name: str,
+) -> NDArray[Any]:
     """Valide un vecteur d'étiquettes de condition (une par ligne)."""
     if labels is None:
         raise ValueError(
@@ -212,12 +283,12 @@ def _prepare_condition_labels(labels: Any, n_points: int, name: str) -> np.ndarr
 
 
 def procrustes_align_bridges(
-    source_coords: np.ndarray,
-    target_coords: np.ndarray,
+    source_coords: ArrayLike,
+    target_coords: ArrayLike,
     allow_reflection: bool = True,
     return_raw_distances: bool = False,
-    centering_mode: str = "common",
-    condition_labels: Optional[np.ndarray] = None,
+    centering_mode: CenteringMode = "common",
+    condition_labels: Optional[ArrayLike] = None,
 ) -> Dict[str, Any]:
     """
     Estime une similitude (translation, rotation, réflexion optionnelle,
@@ -265,8 +336,8 @@ def procrustes_align_bridges(
     source_mean = X.mean(axis=0)
     target_mean = Y.mean(axis=0)
 
-    source_means_by_condition = None
-    target_means_by_condition = None
+    source_means_by_condition: Optional[Dict[Any, NDArray[np.floating]]] = None
+    target_means_by_condition: Optional[Dict[Any, NDArray[np.floating]]] = None
 
     if mode == "common":
         Xc = X - source_mean
@@ -337,7 +408,7 @@ def procrustes_align_bridges(
     residual = aligned_coords - target
     disparity = float(np.sum(residual ** 2) / target_norm_sq)
 
-    result = {
+    result: Dict[str, Any] = {
         "aligned_coords": aligned_coords,
         "rotation": R,
         "scale": scale,
@@ -358,10 +429,10 @@ def procrustes_align_bridges(
 
 
 def apply_procrustes_transform(
-    coords: np.ndarray,
-    transform: Dict[str, Any],
-    condition_labels: Optional[np.ndarray] = None,
-) -> np.ndarray:
+    coords: ArrayLike,
+    transform: Mapping[str, Any],
+    condition_labels: Optional[ArrayLike] = None,
+) -> NDArray[np.floating]:
     """
     Applique une transformation Procrustes DÉJÀ ESTIMÉE, sans la réestimer.
 
@@ -375,14 +446,20 @@ def apply_procrustes_transform(
     obligatoire ; une condition absente de l'entraînement lève une erreur
     (aucun repli silencieux vers le centre commun).
     """
-    if not isinstance(transform, dict):
+    if not isinstance(transform, Mapping):
         raise ValueError("transform doit être un dictionnaire.")
-    if "transform" in transform and isinstance(transform["transform"], dict):
+    if "transform" in transform and isinstance(transform["transform"], Mapping):
         transform = transform["transform"]
 
     required = (
-        "centering_mode", "rotation", "scale", "source_mean", "target_mean",
-        "source_dim", "target_dim", "dimension",
+        "centering_mode",
+        "rotation",
+        "scale",
+        "source_mean",
+        "target_mean",
+        "source_dim",
+        "target_dim",
+        "dimension",
     )
     missing = [key for key in required if key not in transform]
     if missing:
@@ -412,12 +489,18 @@ def apply_procrustes_transform(
     X[:, :source_dim] = X_in
 
     if mode == "common":
-        sm = _as_finite_array(transform["source_mean"], "transform.source_mean", ndim=1)
-        tm = _as_finite_array(transform["target_mean"], "transform.target_mean", ndim=1)
+        sm = _as_finite_array(
+            transform["source_mean"], "transform.source_mean", ndim=1
+        )
+        tm = _as_finite_array(
+            transform["target_mean"], "transform.target_mean", ndim=1
+        )
         aligned = scale * ((X - sm) @ R) + tm
         return aligned[:, :target_dim]
 
-    labels = _prepare_condition_labels(condition_labels, X.shape[0], "condition_labels")
+    labels = _prepare_condition_labels(
+        condition_labels, X.shape[0], "condition_labels"
+    )
     sm_by = transform.get("source_means_by_condition")
     tm_by = transform.get("target_means_by_condition")
 
@@ -444,15 +527,16 @@ def apply_procrustes_transform(
 # 3. ESTIMATION D'UNE MÉTRIQUE LOCALE SPD
 # ============================================================================
 
+
 def fit_local_metric_at_anchor(
-    displacements: np.ndarray,
-    thresholds: np.ndarray,
-    G_prior: Optional[np.ndarray] = None,
-    shrink_lambda: float = 0.1,
-    reg: float = 1e-6,
+    displacements: ArrayLike,
+    thresholds: ArrayLike,
+    G_prior: Optional[ArrayLike] = None,
+    shrink_lambda: float = _DEFAULT_SHRINK_LAMBDA,
+    reg: float = _DEFAULT_REG,
     max_iter: int = 2000,
-    eig_floor: float = 1e-9,
-) -> np.ndarray:
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
+) -> NDArray[np.floating]:
     """
     Estime une métrique locale SPD à partir de sondes directionnelles.
 
@@ -538,12 +622,12 @@ def fit_local_metric_at_anchor(
     tril_i, tril_j = np.tril_indices(d)
     theta0 = L0[tril_i, tril_j].copy()
 
-    def unpack(theta: np.ndarray) -> np.ndarray:
+    def unpack(theta: NDArray[np.floating]) -> NDArray[np.floating]:
         A = np.zeros((d, d))
         A[tril_i, tril_j] = theta
         return A
 
-    def objective(theta: np.ndarray) -> float:
+    def objective(theta: NDArray[np.floating]) -> float:
         A = unpack(theta)
         G = A @ A.T
         predicted = np.einsum("ni,ij,nj->n", V, G, V)
@@ -579,24 +663,22 @@ def fit_local_metric_at_anchor(
 # 4. INTERPOLATION DES MÉTRIQUES LOCALES
 # ============================================================================
 
-_INTERPOLATIONS = ("linear", "log_euclidean")
 
-
-def _check_interpolation(interpolation: Any) -> str:
+def _check_interpolation(interpolation: Any) -> InterpolationMode:
     if interpolation not in _INTERPOLATIONS:
         raise ValueError(
             f"interpolation doit appartenir à {_INTERPOLATIONS} ; "
             f"valeur reçue : {interpolation!r}."
         )
-    return str(interpolation)
+    return str(interpolation)  # type: ignore[return-value]
 
 
 def _prepare_anchor_metrics(
-    anchor_points: np.ndarray,
-    anchor_metrics: np.ndarray,
+    anchor_points: ArrayLike,
+    anchor_metrics: ArrayLike,
     eig_floor: float,
-    interpolation: str = "linear",
-):
+    interpolation: InterpolationMode = "linear",
+) -> Tuple[NDArray[np.floating], NDArray[np.floating]]:
     """
     Valide les ancres et régularise leurs métriques UNE seule fois.
 
@@ -625,13 +707,13 @@ def _prepare_anchor_metrics(
 
 
 def _interpolate_prepared(
-    X: np.ndarray,
-    anchors: np.ndarray,
-    spd_metrics: np.ndarray,
+    X: NDArray[np.floating],
+    anchors: NDArray[np.floating],
+    spd_metrics: NDArray[np.floating],
     bandwidth: float,
     eig_floor: float,
-    interpolation: str = "linear",
-) -> np.ndarray:
+    interpolation: InterpolationMode = "linear",
+) -> NDArray[np.floating]:
     """Interpolation par lot avec ancres déjà validées et préparées."""
     distances_sq = np.sum(
         (X[:, None, :] - anchors[None, :, :]) ** 2, axis=2
@@ -674,13 +756,13 @@ def _check_bandwidth(bandwidth: Any) -> float:
 
 
 def interpolate_local_metric_batch(
-    query_points: np.ndarray,
-    anchor_points: np.ndarray,
-    anchor_metrics: np.ndarray,
+    query_points: ArrayLike,
+    anchor_points: ArrayLike,
+    anchor_metrics: ArrayLike,
     bandwidth: float,
-    eig_floor: float = 1e-9,
-    interpolation: str = "linear",
-) -> np.ndarray:
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
+    interpolation: InterpolationMode = "linear",
+) -> NDArray[np.floating]:
     """
     Interpole G(x) pour un lot de points : (m, d) -> (m, d, d).
 
@@ -709,17 +791,21 @@ def interpolate_local_metric_batch(
 
 
 def interpolate_local_metric(
-    query_point: np.ndarray,
-    anchor_points: np.ndarray,
-    anchor_metrics: np.ndarray,
+    query_point: ArrayLike,
+    anchor_points: ArrayLike,
+    anchor_metrics: ArrayLike,
     bandwidth: float,
-    eig_floor: float = 1e-9,
-    interpolation: str = "linear",
-) -> np.ndarray:
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
+    interpolation: InterpolationMode = "linear",
+) -> NDArray[np.floating]:
     """Interpole la métrique locale en un seul point (vecteur 1D)."""
     x = _as_finite_array(query_point, "query_point", ndim=1)
     return interpolate_local_metric_batch(
-        x[None, :], anchor_points, anchor_metrics, bandwidth, eig_floor,
+        x[None, :],
+        anchor_points,
+        anchor_metrics,
+        bandwidth,
+        eig_floor,
         interpolation,
     )[0]
 
@@ -728,14 +814,15 @@ def interpolate_local_metric(
 # 5. INTÉGRATION DE DISTANCE SUR UN CHEMIN
 # ============================================================================
 
+
 def path_integrated_distance(
-    waypoints: np.ndarray,
-    anchor_points: np.ndarray,
-    anchor_metrics: np.ndarray,
+    waypoints: ArrayLike,
+    anchor_points: ArrayLike,
+    anchor_metrics: ArrayLike,
     bandwidth: float,
     n_substeps: int = 20,
-    eig_floor: float = 1e-9,
-    interpolation: str = "linear",
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
+    interpolation: InterpolationMode = "linear",
 ) -> float:
     """
     Intègre une longueur métrique sur un chemin polygonal (vectorisé).
@@ -759,7 +846,9 @@ def path_integrated_distance(
         )
 
     if path.shape[0] == 1:
-        _interpolate_prepared(path, anchors, spd, bandwidth, eig_floor, interpolation)
+        _interpolate_prepared(
+            path, anchors, spd, bandwidth, eig_floor, interpolation
+        )
         return 0.0
 
     starts = path[:-1]
@@ -770,7 +859,9 @@ def path_integrated_distance(
         starts[:, None, :] + t_mid[None, :, None] * deltas[:, None, :]
     ).reshape(-1, path.shape[1])
 
-    G = _interpolate_prepared(mids, anchors, spd, bandwidth, eig_floor, interpolation)
+    G = _interpolate_prepared(
+        mids, anchors, spd, bandwidth, eig_floor, interpolation
+    )
     deltas_rep = np.repeat(deltas, n_substeps, axis=0)
 
     local_sq = np.einsum("mi,mij,mj->m", deltas_rep, G, deltas_rep)
@@ -787,15 +878,16 @@ def path_integrated_distance(
 # 6. VOLUME LOCAL
 # ============================================================================
 
+
 def local_volume_in_region(
-    region_samples: np.ndarray,
-    anchor_points: np.ndarray,
-    anchor_metrics: np.ndarray,
+    region_samples: ArrayLike,
+    anchor_points: ArrayLike,
+    anchor_metrics: ArrayLike,
     bandwidth: float,
     region_base_volume: float,
-    eig_floor: float = 1e-9,
+    eig_floor: float = _DEFAULT_EIG_FLOOR,
     chunk_size: int = 4096,
-    interpolation: str = "linear",
+    interpolation: InterpolationMode = "linear",
 ) -> Dict[str, float]:
     """
     Estime un volume transformé par une métrique locale (vectorisé, par blocs).
@@ -825,7 +917,7 @@ def local_volume_in_region(
         )
 
     log_max = math.log(np.finfo(float).max)
-    parts = []
+    parts: List[NDArray[np.floating]] = []
 
     for start in range(0, len(samples), chunk_size):
         block = samples[start : start + chunk_size]
@@ -867,11 +959,12 @@ def local_volume_in_region(
 # 7. CALIBRATION LINÉAIRE
 # ============================================================================
 
+
 def fit_linear_scale(
-    raw_distances: np.ndarray,
-    true_distances: np.ndarray,
+    raw_distances: ArrayLike,
+    true_distances: ArrayLike,
     fit_intercept: bool = True,
-) -> Dict[str, float]:
+) -> LinearScaleModel:
     """
     Ajuste true ≈ a + b * raw. La pente doit être non négative afin de
     préserver l'ordre des distances.
@@ -916,13 +1009,13 @@ def fit_linear_scale(
 
 
 def apply_linear_scale(
-    raw_distances: np.ndarray,
-    model: Dict[str, float],
-) -> np.ndarray:
+    raw_distances: ArrayLike,
+    model: Mapping[str, float],
+) -> NDArray[np.floating]:
     """Applique une calibration linéaire non décroissante."""
     x = _as_finite_array(raw_distances, "raw_distances")
 
-    if not isinstance(model, dict):
+    if not isinstance(model, Mapping):
         raise ValueError("model doit être un dictionnaire.")
 
     try:
@@ -945,10 +1038,11 @@ def apply_linear_scale(
 # 8. CALIBRATION MONOTONE : PAVA
 # ============================================================================
 
+
 def _pool_adjacent_violators(
-    values: np.ndarray,
-    weights: np.ndarray,
-) -> np.ndarray:
+    values: ArrayLike,
+    weights: ArrayLike,
+) -> NDArray[np.floating]:
     """Régression isotone non décroissante par PAVA."""
     y = _as_finite_array(values, "values", ndim=1)
     w = _as_finite_array(weights, "weights", ndim=1)
@@ -960,7 +1054,10 @@ def _pool_adjacent_violators(
     if np.any(w <= 0):
         raise ValueError("Tous les poids doivent être strictement positifs.")
 
-    vals, wts, starts, ends = [], [], [], []
+    vals: List[float] = []
+    wts: List[float] = []
+    starts: List[int] = []
+    ends: List[int] = []
 
     for i, (value, weight) in enumerate(zip(y, w)):
         vals.append(float(value))
@@ -986,10 +1083,10 @@ def _pool_adjacent_violators(
 
 
 def fit_monotone_binned(
-    raw_distances: np.ndarray,
-    true_distances: np.ndarray,
+    raw_distances: ArrayLike,
+    true_distances: ArrayLike,
     n_bins: int = 6,
-) -> Dict[str, Any]:
+) -> MonotoneModel:
     """
     Calibration monotone par classes de quantiles : les moyennes de chaque
     classe sont projetées sur une séquence non décroissante par PAVA.
@@ -1027,18 +1124,20 @@ def fit_monotone_binned(
 
     bin_ids = np.digitize(x, edges[1:-1], right=False)
 
-    centers, means, weights = [], [], []
+    centers_list: List[float] = []
+    means_list: List[float] = []
+    weights_list: List[float] = []
     for bin_id in range(len(edges) - 1):
         mask = bin_ids == bin_id
         if not np.any(mask):
             continue
-        centers.append(float(np.mean(x[mask])))
-        means.append(float(np.mean(y[mask])))
-        weights.append(float(np.sum(mask)))
+        centers_list.append(float(np.mean(x[mask])))
+        means_list.append(float(np.mean(y[mask])))
+        weights_list.append(float(np.sum(mask)))
 
-    centers = np.asarray(centers)
-    means = np.asarray(means)
-    weights = np.asarray(weights)
+    centers = np.asarray(centers_list)
+    means = np.asarray(means_list)
+    weights = np.asarray(weights_list)
 
     order = np.argsort(centers)
     centers, means, weights = centers[order], means[order], weights[order]
@@ -1053,13 +1152,13 @@ def fit_monotone_binned(
 
 
 def apply_monotone_binned(
-    raw_distances: np.ndarray,
-    model: Dict[str, Any],
-) -> np.ndarray:
+    raw_distances: ArrayLike,
+    model: Mapping[str, Any],
+) -> NDArray[np.floating]:
     """Applique une calibration monotone par interpolation linéaire."""
     x = _as_finite_array(raw_distances, "raw_distances")
 
-    if not isinstance(model, dict):
+    if not isinstance(model, Mapping):
         raise ValueError("model doit être un dictionnaire.")
 
     model_type = model.get("type")
@@ -1092,11 +1191,12 @@ def apply_monotone_binned(
 # 9. ÉVALUATION D'UNE CALIBRATION
 # ============================================================================
 
+
 def evaluate_calibration_split(
-    raw_distances: np.ndarray,
-    true_distances: np.ndarray,
-    predicted_distances: np.ndarray,
-) -> Dict[str, Any]:
+    raw_distances: ArrayLike,
+    true_distances: ArrayLike,
+    predicted_distances: ArrayLike,
+) -> CalibrationMetrics:
     """
     Évalue une calibration sur un ensemble indépendant de l'ajustement.
 
@@ -1105,7 +1205,9 @@ def evaluate_calibration_split(
     """
     raw = _validate_nonnegative(raw_distances, "raw_distances").reshape(-1)
     true = _validate_nonnegative(true_distances, "true_distances").reshape(-1)
-    pred = _validate_nonnegative(predicted_distances, "predicted_distances").reshape(-1)
+    pred = _validate_nonnegative(predicted_distances, "predicted_distances").reshape(
+        -1
+    )
 
     if not (len(raw) == len(true) == len(pred)):
         raise ValueError("Les trois vecteurs doivent avoir la même longueur.")
@@ -1141,10 +1243,15 @@ def evaluate_calibration_split(
 # 10. CALIBRATION ET VALIDATION DES PONTS
 # ============================================================================
 
+
 def calibrate_and_validate_bridges(
-    raw_distances: np.ndarray,
-    true_distances: np.ndarray,
+    raw_distances: ArrayLike,
+    true_distances: ArrayLike,
     seed: int = 42,
+    test_fraction: float = 0.20,
+    validation_fraction: float = 0.20,
+    slope_tolerance: float = _SLOPE_TOLERANCE,
+    min_spearman: float = _MIN_SPEARMAN,
 ) -> Dict[str, Any]:
     """
     Compare une calibration linéaire et une calibration monotone.
@@ -1163,6 +1270,13 @@ def calibrate_and_validate_bridges(
     est retenu ; la raison figure dans `diagnostics["linear_unavailable"]`.
 
     Minimum : 8 paires.
+
+    Paramètres additionnels (nouveautés v1.1)
+    ----------------------------------------
+    test_fraction, validation_fraction
+        Fractions pour le découpage (doivent laisser ≥ 4 paires en calibration).
+    slope_tolerance, min_spearman
+        Seuils d'alerte opérationnelle (non tests d'équivalence formels).
     """
     raw = _validate_nonnegative(raw_distances, "raw_distances").reshape(-1)
     true = _validate_nonnegative(true_distances, "true_distances").reshape(-1)
@@ -1184,10 +1298,26 @@ def calibrate_and_validate_bridges(
     ):
         raise ValueError("seed doit être un entier.")
 
+    test_fraction = float(test_fraction)
+    validation_fraction = float(validation_fraction)
+    if not (0.0 < test_fraction < 1.0) or not (0.0 < validation_fraction < 1.0):
+        raise ValueError(
+            "test_fraction et validation_fraction doivent être dans (0, 1)."
+        )
+    if test_fraction + validation_fraction >= 1.0:
+        raise ValueError(
+            "La somme test_fraction + validation_fraction doit être < 1."
+        )
+
+    slope_tolerance = float(slope_tolerance)
+    min_spearman = float(min_spearman)
+    if slope_tolerance < 0 or min_spearman < -1 or min_spearman > 1:
+        raise ValueError("Seuils d'alerte invalides.")
+
     indices = np.random.default_rng(int(seed)).permutation(n)
 
-    n_test = max(2, int(round(0.20 * n)))
-    n_validation = max(2, int(round(0.20 * n)))
+    n_test = max(2, int(round(test_fraction * n)))
+    n_validation = max(2, int(round(validation_fraction * n)))
     n_calibration = n - n_test - n_validation
 
     if n_calibration < 4:
@@ -1205,10 +1335,12 @@ def calibrate_and_validate_bridges(
         raise RuntimeError("Les ensembles ne sont pas disjoints.")
 
     # --- Ajustement exclusivement sur la calibration ---------------------
-    linear_model = None
-    linear_unavailable = None
+    linear_model: Optional[LinearScaleModel] = None
+    linear_unavailable: Optional[str] = None
     try:
-        linear_model = fit_linear_scale(raw[idx_cal], true[idx_cal], fit_intercept=True)
+        linear_model = fit_linear_scale(
+            raw[idx_cal], true[idx_cal], fit_intercept=True
+        )
     except ValueError as exc:
         linear_unavailable = str(exc)
 
@@ -1239,7 +1371,7 @@ def calibrate_and_validate_bridges(
         linear_val_metrics["rmse"] <= monotone_val_metrics["rmse"]
     ):
         selected_name = "linear"
-        selected_model = linear_model
+        selected_model: Union[LinearScaleModel, MonotoneModel] = linear_model
         selected_validation = linear_val_metrics
     else:
         selected_name = monotone_model["type"]
@@ -1259,8 +1391,8 @@ def calibrate_and_validate_bridges(
     slope = test_metrics["slope_pred_vs_ref"]
     rho = test_metrics["spearman"]
 
-    slope_warning = slope is None or abs(slope - 1.0) > 0.25
-    correlation_warning = rho is None or rho < 0.50
+    slope_warning = slope is None or abs(slope - 1.0) > slope_tolerance
+    correlation_warning = rho is None or rho < min_spearman
 
     return {
         "selected_model": selected_name,
@@ -1278,6 +1410,8 @@ def calibrate_and_validate_bridges(
             "validation_indices": idx_val.copy(),
             "test_indices": idx_test.copy(),
             "seed": int(seed),
+            "test_fraction": test_fraction,
+            "validation_fraction": validation_fraction,
         },
         "candidate_validation": {
             "linear": linear_val_metrics,
@@ -1288,10 +1422,12 @@ def calibrate_and_validate_bridges(
             "slope_warning": bool(slope_warning),
             "correlation_warning": bool(correlation_warning),
             "linear_unavailable": linear_unavailable,
+            "slope_tolerance": slope_tolerance,
+            "min_spearman": min_spearman,
             "warning_rule": (
-                "Alerte opérationnelle si la pente test est absente "
-                "ou s'écarte de 1 de plus de 0.25, ou si Spearman "
-                "est absent ou inférieur à 0.50. Ces seuils ne "
+                f"Alerte opérationnelle si la pente test est absente "
+                f"ou s'écarte de 1 de plus de {slope_tolerance}, ou si Spearman "
+                f"est absent ou inférieur à {min_spearman}. Ces seuils ne "
                 "constituent pas un test statistique formel "
                 "d'équivalence."
             ),
@@ -1312,7 +1448,7 @@ def calibrate_and_validate_bridges(
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("LOCAL JND BRIDGE CALIBRATION")
+    print(f"LOCAL JND BRIDGE CALIBRATION  v{__version__}")
     print("=" * 72)
 
     rng = np.random.default_rng(42)
@@ -1320,11 +1456,13 @@ if __name__ == "__main__":
     # 11.1 Procrustes
     reference = rng.normal(size=(30, 3))
     angle = 0.65
-    rotation = np.array([
-        [np.cos(angle), -np.sin(angle), 0.0],
-        [np.sin(angle), np.cos(angle), 0.0],
-        [0.0, 0.0, 1.0],
-    ])
+    rotation = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
     source = 1.8 * reference @ rotation.T + np.array([2.0, -1.0, 0.5])
 
     procrustes = procrustes_align_bridges(
@@ -1335,24 +1473,38 @@ if __name__ == "__main__":
     print("Disparity :", procrustes["disparity"])
 
     # 11.2 Métrique locale
-    displacements = np.array([
-        [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
-        [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0],
-        [1.0, -1.0, 0.5], [-0.5, 1.0, 1.0],
-    ])
-    true_metric = np.array([
-        [2.0, 0.2, 0.1],
-        [0.2, 1.5, 0.15],
-        [0.1, 0.15, 1.2],
-    ])
-    directions = displacements / np.linalg.norm(displacements, axis=1, keepdims=True)
+    displacements = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, -1.0, 0.5],
+            [-0.5, 1.0, 1.0],
+        ]
+    )
+    true_metric = np.array(
+        [
+            [2.0, 0.2, 0.1],
+            [0.2, 1.5, 0.15],
+            [0.1, 0.15, 1.2],
+        ]
+    )
+    directions = displacements / np.linalg.norm(
+        displacements, axis=1, keepdims=True
+    )
     thresholds = 1.0 / np.sqrt(
         np.einsum("ni,ij,nj->n", directions, true_metric, directions)
     )
 
     estimated_metric = fit_local_metric_at_anchor(
-        displacements, thresholds, G_prior=np.eye(3),
-        shrink_lambda=0.01, reg=1e-8,
+        displacements,
+        thresholds,
+        G_prior=np.eye(3),
+        shrink_lambda=0.01,
+        reg=1e-8,
     )
     print("\n[2] MÉTRIQUE LOCALE")
     print("Métrique de référence :")
@@ -1362,27 +1514,46 @@ if __name__ == "__main__":
     print("Valeurs propres estimées :", np.linalg.eigvalsh(estimated_metric))
 
     # 11.3 Interpolation
-    anchor_points = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    anchor_points = np.array(
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    )
     anchor_metrics = np.stack([np.eye(3), true_metric, 1.5 * np.eye(3)])
     query = np.array([0.1, 0.2, 0.0])
 
     print("\n[3] INTERPOLATION")
-    print(interpolate_local_metric(query, anchor_points, anchor_metrics, bandwidth=1.0))
+    print(
+        interpolate_local_metric(
+            query, anchor_points, anchor_metrics, bandwidth=1.0
+        )
+    )
 
     # 11.4 Distance intégrée
-    waypoints = np.array([[-0.8, 0.0, 0.0], [0.0, 0.5, 0.0], [0.8, 0.0, 0.0]])
+    waypoints = np.array(
+        [[-0.8, 0.0, 0.0], [0.0, 0.5, 0.0], [0.8, 0.0, 0.0]]
+    )
     print("\n[4] DISTANCE INTÉGRÉE")
-    print(path_integrated_distance(
-        waypoints, anchor_points, anchor_metrics, bandwidth=1.0, n_substeps=50
-    ))
+    print(
+        path_integrated_distance(
+            waypoints,
+            anchor_points,
+            anchor_metrics,
+            bandwidth=1.0,
+            n_substeps=50,
+        )
+    )
 
     # 11.5 Volume local
     region_samples = rng.uniform(-1.0, 1.0, size=(200, 3))
     print("\n[5] VOLUME LOCAL")
-    print(local_volume_in_region(
-        region_samples, anchor_points, anchor_metrics,
-        bandwidth=1.0, region_base_volume=8.0,
-    ))
+    print(
+        local_volume_in_region(
+            region_samples,
+            anchor_points,
+            anchor_metrics,
+            bandwidth=1.0,
+            region_base_volume=8.0,
+        )
+    )
 
     # 11.6 Calibration
     n_pairs = 200
@@ -1398,7 +1569,9 @@ if __name__ == "__main__":
     print("\n[6] CALIBRATION")
     print("Modèle sélectionné :", calibration_result["selected_model"])
     print("Validation :", calibration_result["validation"])
-    print("Test indépendant au niveau des paires :", calibration_result["test"])
+    print(
+        "Test indépendant au niveau des paires :", calibration_result["test"]
+    )
     print("Diagnostics :", calibration_result["diagnostics"])
 
     print("\n" + "=" * 72)
