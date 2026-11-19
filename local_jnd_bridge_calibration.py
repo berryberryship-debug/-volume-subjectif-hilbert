@@ -8,7 +8,8 @@ LOCAL JND BRIDGE CALIBRATION
 Calibration de distances perceptives et métriques locales.
 
 Fonctions principales :
-    - alignement Procrustes ;
+    - alignement Procrustes (estimation puis application figée,
+      centrage commun ou par condition) ;
     - estimation de métriques SPD ;
     - interpolation de métriques locales (unitaire et par lot) ;
     - intégration de distances sur des chemins (vectorisée) ;
@@ -58,6 +59,7 @@ __all__ = [
     "path_integrated_distance",
     "local_volume_in_region",
     "procrustes_align_bridges",
+    "apply_procrustes_transform",
     "calibrate_and_validate_bridges",
     "to_jsonable",
 ]
@@ -162,33 +164,93 @@ def to_jsonable(obj: Any) -> Any:
 
 
 # ============================================================================
-# 2. ALIGNEMENT PROCRUSTES
+# 2. ALIGNEMENT PROCRUSTES : ESTIMATION ET APPLICATION FIGÉE
 # ============================================================================
+#
+# Deux modes de centrage :
+#
+#   "common"        : un seul centre source et un seul centre cible, estimés
+#                     sur l'ensemble des ponts d'entraînement. Référentiel
+#                     commun : la même transformation affine est appliquée à
+#                     toutes les conditions (analyse principale).
+#
+#   "per_condition" : rotation et échelle restent COMMUNES (estimées sur les
+#                     ponts centrés condition par condition), mais chaque
+#                     condition a son propre centre source et son propre
+#                     centre cible. Les différences de position moyenne entre
+#                     conditions sont donc absorbées par le centrage
+#                     (analyse de sensibilité).
+#
+# La transformation est estimée UNE fois (procrustes_align_bridges), puis
+# appliquée sans réestimation (apply_procrustes_transform) aux états de
+# validation et de test.
+
+_CENTERING_MODES = ("common", "per_condition")
+
+
+def _check_centering_mode(centering_mode: Any) -> str:
+    if centering_mode not in _CENTERING_MODES:
+        raise ValueError(
+            f"centering_mode doit appartenir à {_CENTERING_MODES} ; "
+            f"valeur reçue : {centering_mode!r}."
+        )
+    return str(centering_mode)
+
+
+def _prepare_condition_labels(labels: Any, n_points: int, name: str) -> np.ndarray:
+    """Valide un vecteur d'étiquettes de condition (une par ligne)."""
+    if labels is None:
+        raise ValueError(
+            f"{name} est obligatoire lorsque centering_mode='per_condition'."
+        )
+    arr = np.asarray(labels)
+    if arr.ndim != 1 or len(arr) != n_points:
+        raise ValueError(
+            f"{name} doit être un vecteur 1D de longueur {n_points}."
+        )
+    return arr
+
 
 def procrustes_align_bridges(
     source_coords: np.ndarray,
     target_coords: np.ndarray,
     allow_reflection: bool = True,
     return_raw_distances: bool = False,
+    centering_mode: str = "common",
+    condition_labels: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
-    Aligne une configuration source sur une configuration cible.
+    Estime une similitude (translation, rotation, réflexion optionnelle,
+    échelle isotrope) de la configuration source vers la cible.
 
-    Transformations : translation, rotation, réflexion optionnelle,
-    changement d'échelle isotrope. Coordonnées en lignes.
-
-        X_aligned = scale * (X_centered @ R) + target_mean
+        X_aligned = scale * ((X - source_mean) @ R) + target_mean
 
     R est calculée par SVD de H = Xc.T @ Yc = U S Vt, avec R = U D Vt.
     Aucune permutation des points n'est effectuée.
+
+    Paramètres
+    ----------
+    centering_mode
+        "common" (défaut) : centres globaux uniques.
+        "per_condition"   : centres par condition ; rotation et échelle
+                            communes. Exige `condition_labels` et au moins
+                            2 ponts par condition.
+    condition_labels
+        Une étiquette par ligne (mode "per_condition" uniquement).
+
+    La clé `transform` du résultat contient tout ce qu'il faut pour appliquer
+    la même transformation figée à de nouvelles coordonnées :
+    `apply_procrustes_transform(new_coords, result)`.
+
+    `disparity` est la somme des carrés des résidus divisée par la somme des
+    carrés de la cible centrée (centrée par condition en mode "per_condition").
     """
     source = _validate_points(source_coords, "source_coords", min_points=2)
     target = _validate_points(target_coords, "target_coords", min_points=2)
+    mode = _check_centering_mode(centering_mode)
 
     if source.shape[0] != target.shape[0]:
-        raise ValueError(
-            "Les configurations doivent avoir le même nombre de points."
-        )
+        raise ValueError("Les configurations doivent avoir le même nombre de points.")
     if not isinstance(allow_reflection, (bool, np.bool_)):
         raise ValueError("allow_reflection doit être booléen.")
 
@@ -202,8 +264,36 @@ def procrustes_align_bridges(
 
     source_mean = X.mean(axis=0)
     target_mean = Y.mean(axis=0)
-    Xc = X - source_mean
-    Yc = Y - target_mean
+
+    source_means_by_condition = None
+    target_means_by_condition = None
+
+    if mode == "common":
+        Xc = X - source_mean
+        Yc = Y - target_mean
+    else:
+        labels = _prepare_condition_labels(
+            condition_labels, n_points, "condition_labels"
+        )
+        Xc = np.empty_like(X)
+        Yc = np.empty_like(Y)
+        source_means_by_condition = {}
+        target_means_by_condition = {}
+
+        for label in np.unique(labels):
+            mask = labels == label
+            if int(np.sum(mask)) < 2:
+                raise ValueError(
+                    f"La condition {label!r} contient moins de 2 ponts : "
+                    "centrage par condition impossible."
+                )
+            key = label.item() if hasattr(label, "item") else label
+            sm_c = X[mask].mean(axis=0)
+            tm_c = Y[mask].mean(axis=0)
+            source_means_by_condition[key] = sm_c
+            target_means_by_condition[key] = tm_c
+            Xc[mask] = X[mask] - sm_c
+            Yc[mask] = Y[mask] - tm_c
 
     source_norm_sq = float(np.sum(Xc ** 2))
     target_norm_sq = float(np.sum(Yc ** 2))
@@ -224,10 +314,28 @@ def procrustes_align_bridges(
     trace_opt = float(np.sum(singular_values * np.diag(correction)))
     scale = max(0.0, trace_opt / source_norm_sq)
 
-    aligned_full = scale * (Xc @ R) + target_mean
-    aligned_coords = aligned_full[:, : target.shape[1]]
+    transform = {
+        "centering_mode": mode,
+        "rotation": R,
+        "scale": scale,
+        "source_mean": source_mean,
+        "target_mean": target_mean,
+        "source_means_by_condition": source_means_by_condition,
+        "target_means_by_condition": target_means_by_condition,
+        "source_dim": int(source.shape[1]),
+        "target_dim": int(target.shape[1]),
+        "dimension": int(dimension),
+        "allow_reflection": bool(allow_reflection),
+    }
 
-    disparity = float(np.sum((aligned_full - Y) ** 2) / target_norm_sq)
+    aligned_coords = apply_procrustes_transform(
+        source,
+        transform,
+        condition_labels=condition_labels if mode == "per_condition" else None,
+    )
+
+    residual = aligned_coords - target
+    disparity = float(np.sum(residual ** 2) / target_norm_sq)
 
     result = {
         "aligned_coords": aligned_coords,
@@ -235,8 +343,10 @@ def procrustes_align_bridges(
         "scale": scale,
         "disparity": disparity,
         "allow_reflection": bool(allow_reflection),
+        "centering_mode": mode,
         "source_mean": source_mean,
         "target_mean": target_mean,
+        "transform": transform,
     }
 
     if return_raw_distances:
@@ -245,6 +355,89 @@ def procrustes_align_bridges(
         result["aligned_distances"] = squareform(pdist(aligned_coords))
 
     return result
+
+
+def apply_procrustes_transform(
+    coords: np.ndarray,
+    transform: Dict[str, Any],
+    condition_labels: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Applique une transformation Procrustes DÉJÀ ESTIMÉE, sans la réestimer.
+
+    `transform` est soit la clé `transform` du résultat de
+    `procrustes_align_bridges`, soit ce résultat complet.
+
+    En mode "common" : scale * ((X - source_mean) @ R) + target_mean.
+
+    En mode "per_condition" : chaque ligne est centrée avec les moyennes de
+    SA condition, enregistrées à l'estimation. `condition_labels` est
+    obligatoire ; une condition absente de l'entraînement lève une erreur
+    (aucun repli silencieux vers le centre commun).
+    """
+    if not isinstance(transform, dict):
+        raise ValueError("transform doit être un dictionnaire.")
+    if "transform" in transform and isinstance(transform["transform"], dict):
+        transform = transform["transform"]
+
+    required = (
+        "centering_mode", "rotation", "scale", "source_mean", "target_mean",
+        "source_dim", "target_dim", "dimension",
+    )
+    missing = [key for key in required if key not in transform]
+    if missing:
+        raise ValueError(f"transform incomplet ; clés manquantes : {missing}.")
+
+    mode = _check_centering_mode(transform["centering_mode"])
+    X_in = _validate_points(coords, "coords")
+
+    dimension = int(transform["dimension"])
+    source_dim = int(transform["source_dim"])
+    target_dim = int(transform["target_dim"])
+
+    if X_in.shape[1] != source_dim:
+        raise ValueError(
+            f"coords doit avoir {source_dim} colonne(s) ; reçu {X_in.shape[1]}."
+        )
+
+    R = _as_finite_array(transform["rotation"], "transform.rotation", ndim=2)
+    if R.shape != (dimension, dimension):
+        raise ValueError("transform.rotation a une forme incompatible.")
+
+    scale = float(transform["scale"])
+    if not np.isfinite(scale) or scale < 0:
+        raise ValueError("transform.scale doit être fini et non négatif.")
+
+    X = np.zeros((X_in.shape[0], dimension))
+    X[:, :source_dim] = X_in
+
+    if mode == "common":
+        sm = _as_finite_array(transform["source_mean"], "transform.source_mean", ndim=1)
+        tm = _as_finite_array(transform["target_mean"], "transform.target_mean", ndim=1)
+        aligned = scale * ((X - sm) @ R) + tm
+        return aligned[:, :target_dim]
+
+    labels = _prepare_condition_labels(condition_labels, X.shape[0], "condition_labels")
+    sm_by = transform.get("source_means_by_condition")
+    tm_by = transform.get("target_means_by_condition")
+
+    if not sm_by or not tm_by:
+        raise ValueError("transform ne contient pas les moyennes par condition.")
+
+    aligned = np.empty_like(X)
+    for label in np.unique(labels):
+        key = label.item() if hasattr(label, "item") else label
+        if key not in sm_by or key not in tm_by:
+            raise ValueError(
+                f"Condition {key!r} absente de l'entraînement : aucun centre "
+                "enregistré. Aucun repli vers le centre commun n'est appliqué."
+            )
+        mask = labels == label
+        sm_c = _as_finite_array(sm_by[key], "source_means_by_condition", ndim=1)
+        tm_c = _as_finite_array(tm_by[key], "target_means_by_condition", ndim=1)
+        aligned[mask] = scale * ((X[mask] - sm_c) @ R) + tm_c
+
+    return aligned[:, :target_dim]
 
 
 # ============================================================================
