@@ -19,6 +19,14 @@ Fonctions principales :
     - séparation calibration / validation / test ;
     - export JSON des résultats (`to_jsonable`).
 
+Version 1.2.0 : la version complète 1.1.0 est conservée intégralement ;
+la section 11 y ajoute les implémentations du module 1 d'origine
+(spd_logm, spd_expm, fit_frozen_procrustes, transform_frozen_procrustes,
+estimate_local_spd_metric, interpolate_metric_field_log_euclidean,
+compute_integrated_path_distance, compute_local_volume_element,
+pava_isotonic_regression, calibrate_scale_pava), réécrites au-dessus du
+noyau validé et corrigées (voir la section 11 : points C1 à C6).
+
 Conventions :
     - les coordonnées sont représentées en lignes ;
     - les distances sont non négatives ;
@@ -58,7 +66,7 @@ from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import spearmanr
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "apply_linear_scale",
@@ -75,6 +83,17 @@ __all__ = [
     "apply_procrustes_transform",
     "calibrate_and_validate_bridges",
     "to_jsonable",
+    # API historique (section 11)
+    "spd_logm",
+    "spd_expm",
+    "fit_frozen_procrustes",
+    "transform_frozen_procrustes",
+    "estimate_local_spd_metric",
+    "interpolate_metric_field_log_euclidean",
+    "compute_integrated_path_distance",
+    "compute_local_volume_element",
+    "pava_isotonic_regression",
+    "calibrate_scale_pava",
     "__version__",
 ]
 
@@ -1443,7 +1462,313 @@ def calibrate_and_validate_bridges(
 
 
 # ============================================================================
-# 11. DÉMONSTRATION
+# 11. API HISTORIQUE (MODULE 1 D'ORIGINE) — IMPLÉMENTATIONS RÉÉCRITES
+# ============================================================================
+#
+# Les noms et signatures du module 1 d'origine sont conservés. Corrections :
+#
+#   C1  spd_logm / spd_expm : acceptent aussi des lots (..., d, d) ;
+#       résultat identique pour une matrice unique.
+#   C2  fit_frozen_procrustes / transform_frozen_procrustes : s'appuient sur
+#       procrustes_align_bridges (allow_reflection=False : rotation propre,
+#       comportement d'origine). Entrées validées ; dimensions différentes
+#       gérées ; le dictionnaire garde R, s, mu_source, mu_target et ajoute
+#       "transform" (compatible apply_procrustes_transform).
+#   C3  estimate_local_spd_metric : directions normalisées (le modèle
+#       u^T G u = 1/JND² suppose des vecteurs unitaires), seuils validés
+#       > 0, avertissement d'identifiabilité et de non-convergence.
+#   C4  interpolate_metric_field_log_euclidean : poids stabilisés par
+#       log-sum-exp. L'ancien repli « moyenne globale » quand la somme des
+#       poids passait sous 1e-12 est supprimé : il donnait un champ
+#       discontinu ; l'ancre la plus proche domine désormais.
+#   C5  compute_integrated_path_distance : l'ancienne version sommait n_steps
+#       points avec dt = 1/(n_steps-1), soit un biais de n/(n-1) (et une
+#       division par zéro pour n_steps = 1). Quadrature au point milieu
+#       (path_integrated_distance), sans biais d'échantillonnage.
+#   C6  compute_local_volume_element : plus de plancher artificiel 1e-12 sur
+#       le déterminant (calcul par slogdet) ;
+#       calibrate_scale_pava : les valeurs d_geo identiques sont moyennées
+#       avant PAVA (l'ordre arbitraire des ex æquo changeait le résultat).
+
+
+def spd_logm(G: ArrayLike, floor: float = 1e-12) -> NDArray[np.floating]:
+    """Logarithme matriciel d'une matrice SPD (ou d'un lot (..., d, d))."""
+    A = _as_finite_array(G, "G")
+    if A.ndim < 2 or A.shape[-1] != A.shape[-2]:
+        raise ValueError("G doit être carrée.")
+    S = 0.5 * (A + np.swapaxes(A, -1, -2))
+    eigvals, eigvecs = np.linalg.eigh(S)
+    eigvals = np.maximum(eigvals, float(floor))
+    return (eigvecs * np.log(eigvals)[..., None, :]) @ np.swapaxes(
+        eigvecs, -1, -2
+    )
+
+
+def spd_expm(L: ArrayLike) -> NDArray[np.floating]:
+    """Exponentielle matricielle d'une matrice symétrique (ou d'un lot)."""
+    A = _as_finite_array(L, "L")
+    if A.ndim < 2 or A.shape[-1] != A.shape[-2]:
+        raise ValueError("L doit être carrée.")
+    S = 0.5 * (A + np.swapaxes(A, -1, -2))
+    eigvals, eigvecs = np.linalg.eigh(S)
+    result = (eigvecs * np.exp(eigvals)[..., None, :]) @ np.swapaxes(
+        eigvecs, -1, -2
+    )
+    return 0.5 * (result + np.swapaxes(result, -1, -2))
+
+
+def fit_frozen_procrustes(
+    X_source: ArrayLike,
+    X_target: ArrayLike,
+) -> Dict[str, Any]:
+    """
+    Ajuste une similitude de Procrustes à rotation propre (det = +1) :
+      min_{R, s, t} || s * X_source @ R + t - X_target ||_F^2
+    Retourne les paramètres figés (R, s, mu_source, mu_target) et la clé
+    "transform" utilisable avec apply_procrustes_transform.
+    """
+    result = procrustes_align_bridges(
+        X_source, X_target, allow_reflection=False, centering_mode="common"
+    )
+    t = result["transform"]
+    return {
+        "R": t["rotation"],
+        "s": float(t["scale"]),
+        "mu_source": t["source_mean"],
+        "mu_target": t["target_mean"],
+        "transform": t,
+    }
+
+
+def transform_frozen_procrustes(
+    X_new: ArrayLike,
+    procrustes_params: Mapping[str, Any],
+) -> NDArray[np.floating]:
+    """Applique une transformation de Procrustes figée à de nouvelles coordonnées."""
+    if not isinstance(procrustes_params, Mapping):
+        raise ValueError("procrustes_params doit être un dictionnaire.")
+
+    if isinstance(procrustes_params.get("transform"), Mapping):
+        return apply_procrustes_transform(
+            X_new, procrustes_params["transform"]
+        )
+
+    try:
+        R = _as_finite_array(procrustes_params["R"], "R", ndim=2)
+        s = float(procrustes_params["s"])
+        mu_src = _as_finite_array(
+            procrustes_params["mu_source"], "mu_source", ndim=1
+        )
+        mu_tgt = _as_finite_array(
+            procrustes_params["mu_target"], "mu_target", ndim=1
+        )
+    except KeyError as exc:
+        raise ValueError(
+            "procrustes_params doit contenir R, s, mu_source et mu_target."
+        ) from exc
+
+    transform = {
+        "centering_mode": "common",
+        "rotation": R,
+        "scale": s,
+        "source_mean": mu_src,
+        "target_mean": mu_tgt,
+        "source_dim": int(len(mu_src)),
+        "target_dim": int(len(mu_tgt)),
+        "dimension": int(R.shape[0]),
+    }
+    return apply_procrustes_transform(X_new, transform)
+
+
+def estimate_local_spd_metric(
+    directions: ArrayLike,
+    jnds: ArrayLike,
+    dim: int = 2,
+    reg_diag: float = 1e-4,
+) -> NDArray[np.floating]:
+    """
+    Estime la matrice SPD G(x) à partir d'observations directionnelles :
+      u.T @ G @ u ≈ 1 / JND_u²,  u unitaire.
+    G = L @ L.T + reg_diag * I avec L triangulaire inférieure dont la
+    diagonale est paramétrée par exp(.) (G SPD par construction).
+    """
+    U = _as_finite_array(directions, "directions", ndim=2)
+    dim = _positive_integer(dim, "dim")
+    j = _validate_nonnegative(jnds, "jnds").reshape(-1)
+    reg_diag = float(reg_diag)
+
+    if U.shape[1] != dim:
+        raise ValueError("directions doit avoir `dim` colonnes.")
+    if U.shape[0] != len(j):
+        raise ValueError("Le nombre de directions et de JND doit correspondre.")
+    if np.any(j <= 0):
+        raise ValueError("Tous les JND doivent être strictement positifs.")
+    if not np.isfinite(reg_diag) or reg_diag < 0:
+        raise ValueError("reg_diag doit être fini et non négatif.")
+
+    norms = np.linalg.norm(U, axis=1)
+    if np.any(norms <= np.finfo(float).eps):
+        raise ValueError("Une direction est nulle.")
+    U = U / norms[:, None]  # CORRECTION C3
+    y = 1.0 / (j ** 2)
+
+    n_params = dim * (dim + 1) // 2
+    iu, ju = np.triu_indices(dim)
+    design = U[:, iu] * U[:, ju] * np.where(iu == ju, 1.0, 2.0)
+    if int(np.linalg.matrix_rank(design)) < n_params:
+        warnings.warn(
+            "Les directions ne permettent pas d'identifier tous les "
+            "paramètres de la métrique.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    def unpack_L(params: NDArray[np.floating]) -> NDArray[np.floating]:
+        L = np.zeros((dim, dim), dtype=float)
+        idx = 0
+        for i in range(dim):
+            for k in range(i + 1):
+                L[i, k] = math.exp(params[idx]) if i == k else params[idx]
+                idx += 1
+        return L
+
+    def loss(params: NDArray[np.floating]) -> float:
+        L = unpack_L(params)
+        G = L @ L.T + reg_diag * np.eye(dim)
+        preds = np.sum((U @ G) * U, axis=1)
+        return float(np.mean((preds - y) ** 2))
+
+    res = minimize(loss, x0=np.zeros(n_params), method="BFGS")
+
+    if not np.all(np.isfinite(res.x)) or not np.isfinite(res.fun):
+        raise RuntimeError(f"Estimation de la métrique échouée : {res.message}")
+    if not res.success:
+        warnings.warn(
+            f"BFGS n'a pas déclaré de convergence ({res.message}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    L_opt = unpack_L(res.x)
+    return L_opt @ L_opt.T + reg_diag * np.eye(dim)
+
+
+def interpolate_metric_field_log_euclidean(
+    x_query: ArrayLike,
+    grid_coords: ArrayLike,
+    log_G_grid: ArrayLike,
+    bandwidth: float = 1.0,
+) -> NDArray[np.floating]:
+    """
+    Interpole un champ tensoriel défini par ses LOGARITHMES (log_G_grid) par
+    RBF gaussienne, puis revient à G par exponentielle matricielle.
+    """
+    x = _as_finite_array(x_query, "x_query", ndim=1)
+    grid = _validate_points(grid_coords, "grid_coords")
+    logs = _as_finite_array(log_G_grid, "log_G_grid", ndim=3)
+    bandwidth = _check_bandwidth(bandwidth)
+
+    if x.shape[0] != grid.shape[1]:
+        raise ValueError("x_query et grid_coords doivent avoir la même dimension.")
+    if logs.shape != (grid.shape[0], grid.shape[1], grid.shape[1]):
+        raise ValueError("log_G_grid doit avoir la forme (G, d, d).")
+
+    logs = 0.5 * (logs + np.swapaxes(logs, -1, -2))
+    return _interpolate_prepared(
+        x[None, :], grid, logs, bandwidth, _DEFAULT_EIG_FLOOR, "log_euclidean"
+    )[0]
+
+
+def compute_integrated_path_distance(
+    xA: ArrayLike,
+    xB: ArrayLike,
+    grid_coords: ArrayLike,
+    log_G_grid: ArrayLike,
+    bandwidth: float = 1.0,
+    n_steps: int = 20,
+) -> float:
+    """
+    Longueur riemannienne le long du segment xA -> xB (quadrature au point
+    milieu, n_steps sous-segments) dans le champ log-euclidien log_G_grid.
+    """
+    a = _as_finite_array(xA, "xA", ndim=1)
+    b = _as_finite_array(xB, "xB", ndim=1)
+    n_steps = _positive_integer(n_steps, "n_steps")
+    logs = _as_finite_array(log_G_grid, "log_G_grid", ndim=3)
+    G_grid = spd_expm(logs)
+
+    return path_integrated_distance(
+        np.vstack([a, b]),
+        grid_coords,
+        G_grid,
+        bandwidth,
+        n_substeps=n_steps,
+        interpolation="log_euclidean",
+    )
+
+
+def compute_local_volume_element(
+    x: ArrayLike,
+    grid_coords: ArrayLike,
+    log_G_grid: ArrayLike,
+    bandwidth: float = 1.0,
+) -> float:
+    """Élément de volume riemannien local dV = sqrt(det G(x))."""
+    G_x = interpolate_metric_field_log_euclidean(
+        x, grid_coords, log_G_grid, bandwidth
+    )
+    sign, logdet = np.linalg.slogdet(G_x)
+    if sign <= 0 or not np.isfinite(logdet):
+        raise RuntimeError("Déterminant non positif ou non fini.")
+    return float(math.exp(0.5 * logdet))
+
+
+def pava_isotonic_regression(
+    y_obs: ArrayLike,
+    weights: Optional[ArrayLike] = None,
+) -> NDArray[np.floating]:
+    """Régression isotone croissante (PAVA), poids optionnels."""
+    y = _as_finite_array(y_obs, "y_obs", ndim=1)
+    if weights is None:
+        w = np.ones(len(y), dtype=float)
+    else:
+        w = _as_finite_array(weights, "weights", ndim=1)
+    return _pool_adjacent_violators(y, w)
+
+
+def calibrate_scale_pava(
+    d_geo: ArrayLike,
+    d_subj: ArrayLike,
+) -> Tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """
+    Calibre les distances géodésiques sur les distances subjectives via PAVA.
+    Renvoie (x trié, y calibré) pour chaque observation. Les valeurs de
+    d_geo identiques sont moyennées avant PAVA (indépendance vis-à-vis de
+    l'ordre des ex æquo).
+    """
+    x = _validate_nonnegative(d_geo, "d_geo").reshape(-1)
+    y = _validate_nonnegative(d_subj, "d_subj").reshape(-1)
+    if x.shape != y.shape:
+        raise ValueError("d_geo et d_subj doivent avoir la même longueur.")
+    if len(x) == 0:
+        raise ValueError("Vecteurs vides.")
+
+    order = np.argsort(x, kind="stable")
+    x_sorted = x[order]
+    y_sorted = y[order]
+
+    unique_x, inverse, counts = np.unique(
+        x_sorted, return_inverse=True, return_counts=True
+    )
+    sums = np.bincount(inverse, weights=y_sorted)
+    means = sums / counts
+
+    iso = _pool_adjacent_violators(means, counts.astype(float))
+    return x_sorted, iso[inverse]
+
+
+# ============================================================================
+# 12. DÉMONSTRATION
 # ============================================================================
 
 if __name__ == "__main__":
@@ -1453,7 +1778,7 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(42)
 
-    # 11.1 Procrustes
+    # 12.1 Procrustes
     reference = rng.normal(size=(30, 3))
     angle = 0.65
     rotation = np.array(
@@ -1472,7 +1797,7 @@ if __name__ == "__main__":
     print("Scale :", procrustes["scale"])
     print("Disparity :", procrustes["disparity"])
 
-    # 11.2 Métrique locale
+    # 12.2 Métrique locale
     displacements = np.array(
         [
             [1.0, 0.0, 0.0],
@@ -1513,7 +1838,7 @@ if __name__ == "__main__":
     print(estimated_metric)
     print("Valeurs propres estimées :", np.linalg.eigvalsh(estimated_metric))
 
-    # 11.3 Interpolation
+    # 12.3 Interpolation
     anchor_points = np.array(
         [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
     )
@@ -1527,7 +1852,7 @@ if __name__ == "__main__":
         )
     )
 
-    # 11.4 Distance intégrée
+    # 12.4 Distance intégrée
     waypoints = np.array(
         [[-0.8, 0.0, 0.0], [0.0, 0.5, 0.0], [0.8, 0.0, 0.0]]
     )
@@ -1542,7 +1867,7 @@ if __name__ == "__main__":
         )
     )
 
-    # 11.5 Volume local
+    # 12.5 Volume local
     region_samples = rng.uniform(-1.0, 1.0, size=(200, 3))
     print("\n[5] VOLUME LOCAL")
     print(
@@ -1555,7 +1880,7 @@ if __name__ == "__main__":
         )
     )
 
-    # 11.6 Calibration
+    # 12.6 Calibration
     n_pairs = 200
     raw_distances = rng.uniform(0.1, 10.0, size=n_pairs)
     noise = rng.normal(0.0, 0.15, size=n_pairs)
@@ -1573,6 +1898,24 @@ if __name__ == "__main__":
         "Test indépendant au niveau des paires :", calibration_result["test"]
     )
     print("Diagnostics :", calibration_result["diagnostics"])
+
+    # 12.7 API historique (section 11)
+    print("\n[7] API HISTORIQUE")
+    fp = fit_frozen_procrustes(reference, source)
+    back = transform_frozen_procrustes(reference, fp)
+    print("Procrustes figé, erreur max :", float(np.max(np.abs(back - source))))
+    g_est = estimate_local_spd_metric(directions, thresholds, dim=3, reg_diag=0.0)
+    print("Métrique historique, erreur max :",
+          float(np.max(np.abs(g_est - true_metric))))
+    logs = np.stack([spd_logm(g) for g in anchor_metrics])
+    print(
+        "Distance historique :",
+        compute_integrated_path_distance(
+            waypoints[0], waypoints[-1], anchor_points, logs, 1.0, 50
+        ),
+    )
+    xs, ys = calibrate_scale_pava(raw_distances, true_distances)
+    print("PAVA monotone :", bool(np.all(np.diff(ys) >= -1e-12)))
 
     print("\n" + "=" * 72)
     print("FIN DE LA DÉMONSTRATION")
