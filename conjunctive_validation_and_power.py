@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Validation conjonctive (JND, champ G, volume) et simulation de puissance.
+
+Version corrigée. Les modifications portent la mention « CORRECTION » :
+  C1. spd_logm / spd_expm acceptent des lots (..., k, k) ; résultat identique
+      à la version matrice unique.
+  C2. compute_session_icc_from_logs : la branche n_sessions < 2 (qui mélangeait
+      variance entre grilles et variance entre participants) est remplacée
+      par une erreur explicite ; un ICC interséance n'existe pas avec
+      une seule séance.
+  C3. evaluate_field_stability : boucles triples remplacées par le calcul
+      vectorisé (mêmes valeurs) ; vérification des formes d'entrée.
+  C4. Validation des entrées (longueurs, marges, n_boot) dans les trois volets.
+  C5. Documentation : les « coverage_* » de la simulation mesurent l'inclusion
+      d'une cible précisée dans la docstring, pas une couverture nominale.
+"""
+
 import json
 import math
 import numpy as np
@@ -13,18 +30,26 @@ from scipy.stats import norm
 # ---------------------------------------------------------------------------
 
 def spd_logm(G, floor=1e-12):
-    """Logarithme matriciel exact d'une matrice SPD via décomposition spectrale."""
-    S = 0.5 * (np.asarray(G, dtype=float) + np.asarray(G, dtype=float).T)
+    """
+    Logarithme matriciel d'une matrice SPD (ou d'un lot (..., k, k))
+    via décomposition spectrale.  # CORRECTION C1
+    """
+    A = np.asarray(G, dtype=float)
+    S = 0.5 * (A + np.swapaxes(A, -1, -2))
     eigvals, eigvecs = np.linalg.eigh(S)
     eigvals = np.maximum(eigvals, float(floor))
-    return (eigvecs * np.log(eigvals)[None, :]) @ eigvecs.T
+    return (eigvecs * np.log(eigvals)[..., None, :]) @ np.swapaxes(eigvecs, -1, -2)
 
 
 def spd_expm(L):
-    """Exponentielle matricielle d'une matrice symétrique (garantit G SPD)."""
-    S = 0.5 * (np.asarray(L, dtype=float) + np.asarray(L, dtype=float).T)
+    """
+    Exponentielle matricielle d'une matrice symétrique (ou d'un lot)
+    (garantit G SPD).  # CORRECTION C1
+    """
+    A = np.asarray(L, dtype=float)
+    S = 0.5 * (A + np.swapaxes(A, -1, -2))
     eigvals, eigvecs = np.linalg.eigh(S)
-    return (eigvecs * np.exp(eigvals)[None, :]) @ eigvecs.T
+    return (eigvecs * np.exp(eigvals)[..., None, :]) @ np.swapaxes(eigvecs, -1, -2)
 
 
 def log_euclidean_distance(G1, G2):
@@ -66,16 +91,19 @@ def compute_session_icc_from_logs(logs_psgm):
     Calcule ICC_seance = sigma^2_participant / (sigma^2_participant + sigma^2_seance + sigma^2_erreur)
     à partir du tenseur `logs_psgm` de forme (n_participants, n_sessions, n_grid, n_sym_entries)
     selon la décomposition Y_{isgm} = mu_{gm} + u_{igm} + v_{isgm} + e_{isgm}.
+
+    Estimateur ANOVA à un facteur (participant) : sigma^2_seance et sigma^2_erreur
+    sont confondues dans le carré moyen intra-participant.
     """
     arr = np.asarray(logs_psgm, dtype=float)
+    if arr.ndim != 4:
+        raise ValueError("logs_psgm doit avoir la forme (participant, seance, grille, entrees).")
     n_p, n_s, n_g, _ = arr.shape
     if n_p < 2:
         return 0.0
     if n_s < 2:
-        mean_by_grid = np.mean(arr[:, 0], axis=0)
-        vb = float(np.mean(np.var(mean_by_grid, axis=0, ddof=1))) if n_g > 1 else 0.0
-        vw = float(np.mean(np.var(arr[:, 0], axis=0, ddof=1)))
-        return vb / max(vb + vw, 1e-12)
+        # CORRECTION C2 : l'ancienne branche calculait des variances sur le mauvais axe.
+        raise ValueError("L'ICC interséance exige au moins 2 séances par participant.")
 
     grand_mean = np.mean(arr, axis=(0, 1), keepdims=True)
     part_mean = np.mean(arr, axis=1, keepdims=True)
@@ -102,6 +130,16 @@ def evaluate_jnd_equivalence(jnd_pred, jnd_obs, cluster_ids, delta_jnd, n_boot=4
     """
     pred = np.asarray(jnd_pred, dtype=float)
     obs = np.asarray(jnd_obs, dtype=float)
+    # CORRECTION C4
+    if pred.shape != obs.shape or pred.ndim != 1 or len(pred) == 0:
+        raise ValueError("jnd_pred et jnd_obs doivent être des vecteurs 1D de même longueur non nulle.")
+    if len(np.asarray(cluster_ids)) != len(pred):
+        raise ValueError("cluster_ids doit avoir la même longueur que jnd_pred.")
+    if not (np.all(np.isfinite(pred)) and np.all(np.isfinite(obs))):
+        raise ValueError("jnd_pred et jnd_obs doivent être finis.")
+    if not (float(delta_jnd) > 0) or int(n_boot) < 1:
+        raise ValueError("delta_jnd doit être > 0 et n_boot >= 1.")
+
     err = pred - obs
 
     bias = float(np.mean(err))
@@ -148,24 +186,23 @@ def evaluate_field_stability(
         raise ValueError("`G_rep_by_participant_session` doit avoir la forme (participant, seance, grille, k, k).")
 
     n_p, n_s, n_grid, k, _ = G_ps.shape
+    # CORRECTION C3/C4
+    if G_d.shape != (n_grid, k, k):
+        raise ValueError("`G_disc_grid` doit avoir la forme (grille, k, k) compatible avec G_rep.")
+    if icc_criterion not in ("global", "q05", "min"):
+        raise ValueError("icc_criterion doit valoir 'global', 'q05' ou 'min'.")
+    if n_s < 2:
+        raise ValueError("Au moins 2 séances par participant sont nécessaires pour l'ICC.")
     triu_i, triu_j = np.triu_indices(k)
 
-    logs_full = np.zeros((n_p, n_s, n_grid, k, k), dtype=float)
-    logs_sym = np.zeros((n_p, n_s, n_grid, len(triu_i)), dtype=float)
-    for i in range(n_p):
-        for s in range(n_s):
-            for g in range(n_grid):
-                L = spd_logm(G_ps[i, s, g])
-                logs_full[i, s, g] = L
-                logs_sym[i, s, g] = L[triu_i, triu_j]
+    # CORRECTION C3 : calcul par lots (valeurs identiques à la triple boucle)
+    logs_full = spd_logm(G_ps)
+    logs_sym = logs_full[..., triu_i, triu_j]
 
     mean_log_rep = np.mean(logs_full, axis=(0, 1))
-    log_disc = np.array([spd_logm(G_d[g]) for g in range(n_grid)], dtype=float)
+    log_disc = spd_logm(G_d)
 
-    dists = np.array(
-        [float(np.linalg.norm(mean_log_rep[g] - log_disc[g], ord="fro")) for g in range(n_grid)],
-        dtype=float,
-    )
+    dists = np.linalg.norm(mean_log_rep - log_disc, ord="fro", axis=(-2, -1))
     q95_dG = float(np.quantile(dists, 0.95))
 
     icc_global = compute_session_icc_from_logs(logs_sym)
@@ -182,7 +219,7 @@ def evaluate_field_stability(
         sub_sym = logs_sym[p_idx]
 
         mean_sub = np.mean(sub_full, axis=(0, 1))
-        b_dists = [float(np.linalg.norm(mean_sub[g] - log_disc[g], ord="fro")) for g in range(n_grid)]
+        b_dists = np.linalg.norm(mean_sub - log_disc, ord="fro", axis=(-2, -1))
         boot_q95[b] = float(np.quantile(b_dists, 0.95))
 
         if icc_criterion == "q05":
@@ -238,6 +275,14 @@ def evaluate_volume_oos_gain(
     y = np.asarray(y_test, dtype=float)
     X0 = np.asarray(X_M0_test, dtype=float)
     v_col = np.asarray(V_psi_test, dtype=float).reshape(-1, 1)
+    # CORRECTION C4
+    n = len(y)
+    if X0.ndim != 2 or X0.shape[0] != n or v_col.shape[0] != n:
+        raise ValueError("y_test, X_M0_test et V_psi_test doivent avoir le même nombre de lignes.")
+    if len(np.asarray(participant_ids)) != n or len(np.asarray(pair_ids)) != n:
+        raise ValueError("participant_ids et pair_ids doivent avoir une entrée par observation.")
+    if np.asarray(beta_M0_frozen).shape[0] != X0.shape[1] or np.asarray(beta_M1_frozen).shape[0] != X0.shape[1] + 1:
+        raise ValueError("Dimensions incompatibles entre les coefficients figés et les matrices de conception.")
     X1 = np.hstack([X0, v_col])
 
     pred_0 = X0 @ np.asarray(beta_M0_frozen, dtype=float)
@@ -403,7 +448,17 @@ def run_joint_power_simulation(
          entre les conditions A et B à l'intérieur de chaque participant-séance.
       3. `true_ellipsoid_expansion` et `true_beta_V` : dilatation géométrique de l'ellipsoïde
          et lien prédictif hors échantillon de V_psi au-delà de M0.
+
+    Note (C5) : `coverage_JND` est la fréquence avec laquelle l'IC95 du biais contient 0
+    (et non le biais vrai, qui n'est pas exactement nul à cause de la non-linéarité
+    JND = G^(-1/2)) ; `coverage_G` est la fréquence avec laquelle l'IC95 de Q95(d_G)
+    contient la valeur vraie calculée sur le champ de la cohorte de réplication.
     """
+    if int(n_sessions) < 2:
+        raise ValueError("n_sessions doit être >= 2 (ICC interséance).")  # CORRECTION C4
+    if int(n_participants) < 4:
+        raise ValueError("n_participants doit être >= 4 (deux cohortes d'au moins 2).")
+
     rng = np.random.default_rng(seed)
     n_grid = 6
     k_rank = 2
