@@ -22,6 +22,18 @@ où L est de forme (n_features, k).
 Le volume est calculé dans l'espace latent de dimension k.
 Il ne faut pas utiliser det(L @ L.T) dans l'espace initial lorsque
 k < n_features.
+
+Version corrigée. Modifications marquées « CORRECTION » :
+  C1. Gradient analytique de la perte (L-BFGS-B ne l'estime plus par
+      différences finies) + option n_starts (redémarrages aléatoires, choisis
+      sur la perte d'entraînement uniquement : aucune fuite).
+  C2. select_k_by_state_cv : le contrôle « n_train <= k_max » rejetait des
+      configurations valides (l'ajustement des distances ne l'exige pas) ;
+      il devient un avertissement. Variable inutilisée supprimée.
+  C3. Règle de sélection optionnelle « one_se » (plus petit k dont le MSE est
+      à moins d'une erreur standard du minimum). Défaut : « min » (inchangé).
+  C4. SubjectiveMetric.fit : paramètre verbose ; sélection de k transmise
+      avec selection_rule.
 """
 
 from __future__ import annotations
@@ -88,21 +100,12 @@ def _validate_square_matrix(
     """
     Vérifie une matrice carrée et la symétrise explicitement.
     """
-    array = _as_finite_array(
-        matrix,
-        name,
-        ndim=2,
-    )
+    array = _as_finite_array(matrix, name, ndim=2)
 
     if array.shape[0] != array.shape[1]:
-        raise ValueError(
-            f"{name} doit être carrée."
-        )
+        raise ValueError(f"{name} doit être carrée.")
 
-    return 0.5 * (
-        array
-        + array.T
-    )
+    return 0.5 * (array + array.T)
 
 
 def _validate_features(
@@ -110,16 +113,10 @@ def _validate_features(
     name: str = "X",
 ) -> np.ndarray:
     """Vérifie une matrice d'états et de caractéristiques."""
-    array = _as_finite_array(
-        X,
-        name,
-        ndim=2,
-    )
+    array = _as_finite_array(X, name, ndim=2)
 
     if array.shape[0] < 2:
-        raise ValueError(
-            f"{name} doit contenir au moins deux états."
-        )
+        raise ValueError(f"{name} doit contenir au moins deux états.")
 
     if array.shape[1] < 1:
         raise ValueError(
@@ -134,20 +131,10 @@ def _validate_xy(
     D: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Vérifie la compatibilité entre X et D."""
-    features = _validate_features(
-        X,
-        "X",
-    )
+    features = _validate_features(X, "X")
+    distances = _validate_square_matrix(D, "D")
 
-    distances = _validate_square_matrix(
-        D,
-        "D",
-    )
-
-    if distances.shape != (
-        features.shape[0],
-        features.shape[0],
-    ):
+    if distances.shape != (features.shape[0], features.shape[0]):
         raise ValueError(
             "D doit avoir une ligne et une colonne par état de X."
         )
@@ -160,21 +147,13 @@ def _positive_integer(
     name: str,
 ) -> int:
     """Valide un entier strictement positif."""
-    if isinstance(
-        value,
-        (bool, np.bool_),
-    ) or not isinstance(
-        value,
-        (int, np.integer),
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
     ):
-        raise ValueError(
-            f"{name} doit être un entier positif."
-        )
+        raise ValueError(f"{name} doit être un entier positif.")
 
     if value < 1:
-        raise ValueError(
-            f"{name} doit être supérieur ou égal à 1."
-        )
+        raise ValueError(f"{name} doit être supérieur ou égal à 1.")
 
     return int(value)
 
@@ -187,22 +166,13 @@ def _validate_pair_mask(
     if pair_mask is None:
         return None
 
-    mask = np.asarray(
-        pair_mask,
-        dtype=bool,
-    )
+    mask = np.asarray(pair_mask, dtype=bool)
 
-    if mask.shape != (
-        n_pairs,
-    ):
-        raise ValueError(
-            f"pair_mask doit avoir la forme ({n_pairs},)."
-        )
+    if mask.shape != (n_pairs,):
+        raise ValueError(f"pair_mask doit avoir la forme ({n_pairs},).")
 
     if not np.any(mask):
-        raise ValueError(
-            "pair_mask ne sélectionne aucune paire."
-        )
+        raise ValueError("pair_mask ne sélectionne aucune paire.")
 
     return mask
 
@@ -211,35 +181,47 @@ def upper_tri_pairs(
     n: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Retourne les indices des paires de la triangulaire supérieure."""
-    n = _positive_integer(
-        n,
-        "n",
-    )
+    n = _positive_integer(n, "n")
 
     if n < 2:
-        raise ValueError(
-            "n doit être supérieur ou égal à 2."
-        )
+        raise ValueError("n doit être supérieur ou égal à 2.")
 
-    return np.triu_indices(
-        n,
-        k=1,
-    )
+    return np.triu_indices(n, k=1)
 
 
 def ball_volume_factor(
     k: int,
 ) -> float:
     """Volume de la boule unité euclidienne en dimension k."""
-    k = _positive_integer(
-        k,
-        "k",
-    )
+    k = _positive_integer(k, "k")
 
-    return float(
-        math.pi ** (k / 2.0)
-        / math.gamma(k / 2.0 + 1.0)
+    return float(math.pi ** (k / 2.0) / math.gamma(k / 2.0 + 1.0))
+
+
+# CORRECTION C3
+def _select_best_k(
+    mean_scores: Dict[int, float],
+    std_scores: Dict[int, float],
+    n_folds: int,
+    selection_rule: str,
+) -> int:
+    """
+    'min'    : k de MSE moyen minimal (comportement historique).
+    'one_se' : plus petit k dont le MSE moyen <= minimum + SE du minimum,
+               SE = std / sqrt(n_folds).
+    """
+    rule = str(selection_rule).lower()
+    if rule not in ("min", "one_se"):
+        raise ValueError("selection_rule doit être 'min' ou 'one_se'.")
+
+    best = min(mean_scores, key=mean_scores.get)
+    if rule == "min":
+        return best
+
+    threshold = mean_scores[best] + std_scores[best] / math.sqrt(
+        max(int(n_folds), 1)
     )
+    return min(k for k, v in mean_scores.items() if v <= threshold)
 
 
 # ============================================================================
@@ -272,9 +254,7 @@ def similarity_to_dissimilarity(
         "similarity_matrix",
     )
 
-    mode = str(
-        mode
-    ).lower()
+    mode = str(mode).lower()
 
     if mode == "one_minus":
         dissimilarity = 1.0 - similarity
@@ -292,13 +272,8 @@ def similarity_to_dissimilarity(
             else float(max_similarity)
         )
 
-        if not (
-            np.isfinite(s_min)
-            and np.isfinite(s_max)
-        ):
-            raise ValueError(
-                "Les bornes de similarité doivent être finies."
-            )
+        if not (np.isfinite(s_min) and np.isfinite(s_max)):
+            raise ValueError("Les bornes de similarité doivent être finies.")
 
         if s_max <= s_min:
             raise ValueError(
@@ -306,19 +281,10 @@ def similarity_to_dissimilarity(
             )
 
         if mode == "linear_max":
-            dissimilarity = (
-                s_max
-                - similarity
-            )
+            dissimilarity = s_max - similarity
 
         elif mode == "linear_range":
-            dissimilarity = (
-                s_max
-                - similarity
-            ) / (
-                s_max
-                - s_min
-            )
+            dissimilarity = (s_max - similarity) / (s_max - s_min)
 
         else:
             raise ValueError(
@@ -326,20 +292,11 @@ def similarity_to_dissimilarity(
                 "'linear_max', 'linear_range' ou 'one_minus'."
             )
 
-    dissimilarity = 0.5 * (
-        dissimilarity
-        + dissimilarity.T
-    )
+    dissimilarity = 0.5 * (dissimilarity + dissimilarity.T)
 
-    dissimilarity = np.maximum(
-        dissimilarity,
-        0.0,
-    )
+    dissimilarity = np.maximum(dissimilarity, 0.0)
 
-    np.fill_diagonal(
-        dissimilarity,
-        0.0,
-    )
+    np.fill_diagonal(dissimilarity, 0.0)
 
     return dissimilarity
 
@@ -367,53 +324,23 @@ def _fit_preprocessing(
     - center : moyenne après mise à l'échelle ;
     - X_centered : données transformées et centrées.
     """
-    features = _validate_features(
-        X,
-        "X",
-    )
+    features = _validate_features(X, "X")
 
-    mu = np.mean(
-        features,
-        axis=0,
-    )
+    mu = np.mean(features, axis=0)
 
     if standardize:
-        sd = np.std(
-            features,
-            axis=0,
-            ddof=1,
-        )
-        sd = np.maximum(
-            sd,
-            1e-8,
-        )
+        sd = np.std(features, axis=0, ddof=1)
+        sd = np.maximum(sd, 1e-8)
     else:
-        sd = np.ones(
-            features.shape[1],
-            dtype=float,
-        )
+        sd = np.ones(features.shape[1], dtype=float)
 
-    X_scaled = (
-        features
-        - mu
-    ) / sd
+    X_scaled = (features - mu) / sd
 
-    center = np.mean(
-        X_scaled,
-        axis=0,
-    )
+    center = np.mean(X_scaled, axis=0)
 
-    X_centered = (
-        X_scaled
-        - center
-    )
+    X_centered = X_scaled - center
 
-    return (
-        mu,
-        sd,
-        center,
-        X_centered,
-    )
+    return (mu, sd, center, X_centered)
 
 
 def _apply_preprocessing(
@@ -425,55 +352,22 @@ def _apply_preprocessing(
     """
     Applique un prétraitement déjà estimé.
     """
-    features = _validate_features(
-        X,
-        "X",
-    )
+    features = _validate_features(X, "X")
 
-    mu = _as_finite_array(
-        mu,
-        "mu",
-        ndim=1,
-    )
-
-    sd = _as_finite_array(
-        sd,
-        "sd",
-        ndim=1,
-    )
-
-    center = _as_finite_array(
-        center,
-        "center",
-        ndim=1,
-    )
+    mu = _as_finite_array(mu, "mu", ndim=1)
+    sd = _as_finite_array(sd, "sd", ndim=1)
+    center = _as_finite_array(center, "center", ndim=1)
 
     if features.shape[1] != len(mu):
-        raise ValueError(
-            "Le nombre de caractéristiques de X et mu diffère."
-        )
+        raise ValueError("Le nombre de caractéristiques de X et mu diffère.")
 
-    if not (
-        len(mu)
-        == len(sd)
-        == len(center)
-    ):
-        raise ValueError(
-            "mu, sd et center doivent avoir la même longueur."
-        )
+    if not (len(mu) == len(sd) == len(center)):
+        raise ValueError("mu, sd et center doivent avoir la même longueur.")
 
     if np.any(sd <= 0):
-        raise ValueError(
-            "sd doit contenir uniquement des valeurs positives."
-        )
+        raise ValueError("sd doit contenir uniquement des valeurs positives.")
 
-    return (
-        (
-            features
-            - mu
-        ) / sd
-        - center
-    )
+    return (features - mu) / sd - center
 
 
 # ============================================================================
@@ -490,47 +384,24 @@ def predict_distances(
     X_centered doit avoir été transformé avec le prétraitement
     d'entraînement.
     """
-    X = _validate_features(
-        X_centered,
-        "X_centered",
-    )
+    X = _validate_features(X_centered, "X_centered")
 
-    projection = _as_finite_array(
-        L,
-        "L",
-        ndim=2,
-    )
+    projection = _as_finite_array(L, "L", ndim=2)
 
     if X.shape[1] != projection.shape[0]:
-        raise ValueError(
-            "X_centered et L ont des dimensions incompatibles."
-        )
+        raise ValueError("X_centered et L ont des dimensions incompatibles.")
 
     latent = X @ projection
 
-    squared_norms = np.sum(
-        latent ** 2,
-        axis=1,
-        keepdims=True,
-    )
+    squared_norms = np.sum(latent ** 2, axis=1, keepdims=True)
 
     squared_distances = (
-        squared_norms
-        + squared_norms.T
-        - 2.0 * (
-            latent
-            @ latent.T
-        )
+        squared_norms + squared_norms.T - 2.0 * (latent @ latent.T)
     )
 
-    squared_distances = np.maximum(
-        squared_distances,
-        0.0,
-    )
+    squared_distances = np.maximum(squared_distances, 0.0)
 
-    return np.sqrt(
-        squared_distances
-    )
+    return np.sqrt(squared_distances)
 
 
 def latent_volume(
@@ -549,21 +420,12 @@ def latent_volume(
     Cette quantité est une mesure de dispersion géométrique latente.
     Elle n'est pas automatiquement le volume d'une région physique.
     """
-    X = _validate_features(
-        X_centered,
-        "X_centered",
-    )
+    X = _validate_features(X_centered, "X_centered")
 
-    projection = _as_finite_array(
-        L,
-        "L",
-        ndim=2,
-    )
+    projection = _as_finite_array(L, "L", ndim=2)
 
     if X.shape[1] != projection.shape[0]:
-        raise ValueError(
-            "X_centered et L ont des dimensions incompatibles."
-        )
+        raise ValueError("X_centered et L ont des dimensions incompatibles.")
 
     latent = X @ projection
     n_states, k = latent.shape
@@ -574,38 +436,20 @@ def latent_volume(
         )
 
     if np.linalg.matrix_rank(
-        latent
-        - np.mean(
-            latent,
-            axis=0,
-            keepdims=True,
-        )
+        latent - np.mean(latent, axis=0, keepdims=True)
     ) < k:
         return 0.0
 
-    covariance = np.cov(
-        latent,
-        rowvar=False,
-        ddof=1,
-    )
+    covariance = np.cov(latent, rowvar=False, ddof=1)
 
-    covariance = np.atleast_2d(
-        covariance
-    )
+    covariance = np.atleast_2d(covariance)
 
-    sign, logdet = np.linalg.slogdet(
-        covariance
-    )
+    sign, logdet = np.linalg.slogdet(covariance)
 
     if sign <= 0 or not np.isfinite(logdet):
         return 0.0
 
-    return float(
-        ball_volume_factor(k)
-        * math.exp(
-            0.5 * logdet
-        )
-    )
+    return float(ball_volume_factor(k) * math.exp(0.5 * logdet))
 
 
 # ============================================================================
@@ -624,15 +468,9 @@ def _mds_initialization(
     Cette fonction ne doit être appelée que lorsque D est complète
     et qu'aucune paire n'est tenue à l'écart.
     """
-    distances = _validate_square_matrix(
-        D,
-        "D",
-    )
+    distances = _validate_square_matrix(D, "D")
 
-    features = _validate_features(
-        X_centered,
-        "X_centered",
-    )
+    features = _validate_features(X_centered, "X_centered")
 
     n_states = distances.shape[0]
 
@@ -643,113 +481,45 @@ def _mds_initialization(
 
     k = int(k)
 
-    if not (
-        1 <= k <= features.shape[1]
-    ):
-        raise ValueError(
-            "k est incompatible avec X_centered."
-        )
+    if not (1 <= k <= features.shape[1]):
+        raise ValueError("k est incompatible avec X_centered.")
 
-    centering = (
-        np.eye(n_states)
-        - np.ones(
-            (
-                n_states,
-                n_states,
-            )
-        ) / n_states
-    )
+    centering = np.eye(n_states) - np.ones((n_states, n_states)) / n_states
 
-    gram = -0.5 * (
-        centering
-        @ (
-            distances ** 2
-        )
-        @ centering
-    )
+    gram = -0.5 * (centering @ (distances ** 2) @ centering)
 
-    gram = 0.5 * (
-        gram
-        + gram.T
-    )
+    gram = 0.5 * (gram + gram.T)
 
-    eigenvalues, eigenvectors = np.linalg.eigh(
-        gram
-    )
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
 
-    order = np.argsort(
-        eigenvalues
-    )[::-1]
+    order = np.argsort(eigenvalues)[::-1]
 
-    eigenvalues = eigenvalues[
-        order
-    ]
+    eigenvalues = eigenvalues[order]
 
-    eigenvectors = eigenvectors[
-        :,
-        order
-    ]
+    eigenvectors = eigenvectors[:, order]
 
-    latent_initial = np.zeros(
-        (
-            n_states,
-            k,
-        ),
-        dtype=float,
-    )
+    latent_initial = np.zeros((n_states, k), dtype=float)
 
     positive = eigenvalues > 1e-10
 
     if np.any(positive):
-        selected = np.where(
-            positive
-        )[0][
-            :k
-        ]
+        selected = np.where(positive)[0][:k]
 
-        latent_initial[
-            :,
-            :len(selected)
-        ] = (
-            eigenvectors[
-                :,
-                selected
-            ]
-            * np.sqrt(
-                np.maximum(
-                    eigenvalues[
-                        selected
-                    ],
-                    0.0,
-                )
-            )
-        )
+        latent_initial[:, : len(selected)] = eigenvectors[
+            :, selected
+        ] * np.sqrt(np.maximum(eigenvalues[selected], 0.0))
 
     regularized_gram = (
-        features.T
-        @ features
-        + max(
-            float(reg),
-            1e-12,
-        )
-        * np.eye(
-            features.shape[1]
-        )
+        features.T @ features
+        + max(float(reg), 1e-12) * np.eye(features.shape[1])
     )
 
     try:
-        return np.linalg.solve(
-            regularized_gram,
-            features.T
-            @ latent_initial,
-        )
+        return np.linalg.solve(regularized_gram, features.T @ latent_initial)
 
     except np.linalg.LinAlgError:
-        return np.linalg.pinv(
-            regularized_gram
-        ) @ (
-            features.T
-            @ latent_initial
+        return np.linalg.pinv(regularized_gram) @ (
+            features.T @ latent_initial
         )
 
 
@@ -761,23 +531,11 @@ def _random_initialization(
     """
     Initialisation aléatoire indépendante des distances.
     """
-    rng = np.random.default_rng(
-        int(seed)
-    )
+    rng = np.random.default_rng(int(seed))
 
-    scale = 1.0 / math.sqrt(
-        max(
-            n_features,
-            1,
-        )
-    )
+    scale = 1.0 / math.sqrt(max(n_features, 1))
 
-    return rng.standard_normal(
-        (
-            n_features,
-            k,
-        )
-    ) * scale
+    return rng.standard_normal((n_features, k)) * scale
 
 
 # ============================================================================
@@ -803,6 +561,7 @@ class CVResult:
     scores: dict
     std_scores: dict
     all_fold_scores: dict
+    selection_rule: str = "min"  # CORRECTION C3 (champ ajouté en dernier)
 
 
 # ============================================================================
@@ -819,6 +578,7 @@ def fit_from_pairwise_dissimilarity(
     init: str = "mds",
     init_seed: int = 0,
     return_details: bool = False,
+    n_starts: int = 1,
 ) -> Union[
     Tuple[np.ndarray, np.ndarray],
     FitResult,
@@ -830,95 +590,57 @@ def fit_from_pairwise_dissimilarity(
 
     init="mds" est autorisé uniquement si aucune paire n'est exclue.
     En validation croisée, utiliser init="random".
-    """
-    X = _validate_features(
-        X_centered,
-        "X_centered",
-    )
 
-    D = _validate_square_matrix(
-        D_train,
-        "D_train",
-    )
+    n_starts > 1 ajoute des redémarrages aléatoires ; le meilleur est choisi
+    sur la perte d'entraînement (les paires exclues ne sont jamais utilisées).
+    """
+    X = _validate_features(X_centered, "X_centered")
+
+    D = _validate_square_matrix(D_train, "D_train")
 
     n_states, n_features = X.shape
 
-    if D.shape != (
-        n_states,
-        n_states,
-    ):
+    if D.shape != (n_states, n_states):
         raise ValueError(
             "D_train doit correspondre au nombre d'états de X_centered."
         )
 
     k = int(k)
 
-    if not (
-        1 <= k <= n_features
-    ):
-        raise ValueError(
-            f"k doit être compris entre 1 et {n_features}."
-        )
+    if not (1 <= k <= n_features):
+        raise ValueError(f"k doit être compris entre 1 et {n_features}.")
 
     reg = float(reg)
 
     if not np.isfinite(reg) or reg < 0:
-        raise ValueError(
-            "reg doit être fini et non négatif."
-        )
+        raise ValueError("reg doit être fini et non négatif.")
 
-    max_iter = _positive_integer(
-        max_iter,
-        "max_iter",
-    )
+    max_iter = _positive_integer(max_iter, "max_iter")
+    n_starts = _positive_integer(n_starts, "n_starts")
 
-    D = np.maximum(
-        D,
-        0.0,
-    )
+    D = np.maximum(D, 0.0)
 
-    np.fill_diagonal(
-        D,
-        0.0,
-    )
+    np.fill_diagonal(D, 0.0)
 
-    i_all, j_all = upper_tri_pairs(
-        n_states
-    )
+    i_all, j_all = upper_tri_pairs(n_states)
 
-    pair_mask = _validate_pair_mask(
-        pair_mask,
-        len(i_all),
-    )
+    pair_mask = _validate_pair_mask(pair_mask, len(i_all))
 
     if pair_mask is None:
         i_upper = i_all
         j_upper = j_all
         all_pairs_used = True
     else:
-        i_upper = i_all[
-            pair_mask
-        ]
-        j_upper = j_all[
-            pair_mask
-        ]
-        all_pairs_used = bool(
-            np.all(pair_mask)
-        )
+        i_upper = i_all[pair_mask]
+        j_upper = j_all[pair_mask]
+        all_pairs_used = bool(np.all(pair_mask))
 
-    target = D[
-        i_upper,
-        j_upper
-    ]
+    target = D[i_upper, j_upper]
 
     if len(target) == 0:
-        raise ValueError(
-            "Aucune paire disponible pour l'ajustement."
-        )
+        raise ValueError("Aucune paire disponible pour l'ajustement.")
 
-    init = str(
-        init
-    ).lower()
+    init = str(init).lower()
 
     if init == "mds":
         if not all_pairs_used:
@@ -927,134 +649,95 @@ def fit_from_pairwise_dissimilarity(
                 "Utiliser init='random' pour éviter la fuite."
             )
 
-        L0 = _mds_initialization(
-            D,
-            X,
-            k,
-            max(
-                reg,
-                1e-12,
-            ),
-        )
+        L0 = _mds_initialization(D, X, k, max(reg, 1e-12))
 
     elif init == "random":
-        L0 = _random_initialization(
-            n_features,
-            k,
-            init_seed,
-        )
+        L0 = _random_initialization(n_features, k, init_seed)
 
     else:
-        raise ValueError(
-            "init doit être 'mds' ou 'random'."
-        )
+        raise ValueError("init doit être 'mds' ou 'random'.")
 
     def unpack(
         theta: np.ndarray,
     ) -> np.ndarray:
-        return theta.reshape(
-            n_features,
-            k,
-        )
+        return theta.reshape(n_features, k)
 
-    def objective(
+    # CORRECTION C1 : différences de caractéristiques précalculées et
+    # gradient analytique.
+    dX = X[i_upper] - X[j_upper]  # (m, n_features)
+    n_pairs_used = len(target)
+
+    def loss_and_grad(
         theta: np.ndarray,
-    ) -> float:
-        L = unpack(
-            theta
+    ) -> Tuple[float, np.ndarray]:
+        L = unpack(theta)
+
+        z = dX @ L  # (m, k)
+        predicted = np.linalg.norm(z, axis=1)
+        residual = predicted - target
+
+        data_loss = float(np.mean(residual ** 2))
+        penalty_value = float(reg * np.sum(L ** 2))
+
+        safe = predicted > 1e-12
+        coefficient = np.zeros_like(predicted)
+        coefficient[safe] = (
+            2.0 * residual[safe] / (n_pairs_used * predicted[safe])
         )
 
-        latent = X @ L
+        gradient = dX.T @ (coefficient[:, None] * z) + 2.0 * reg * L
 
-        delta = (
-            latent[
-                i_upper
-            ]
-            - latent[
-                j_upper
-            ]
+        return data_loss + penalty_value, gradient.ravel()
+
+    starts = [L0]
+    for extra in range(1, n_starts):
+        starts.append(
+            _random_initialization(
+                n_features, k, int(init_seed) + 1000 * extra + 7
+            )
         )
 
-        predicted = np.linalg.norm(
-            delta,
-            axis=1,
+    result = None
+    for start in starts:
+        candidate = minimize(
+            loss_and_grad,
+            x0=start.ravel(),
+            jac=True,
+            method="L-BFGS-B",
+            options={
+                "maxiter": max_iter,
+                "ftol": 1e-12,
+                "gtol": 1e-8,
+                "maxls": 50,
+            },
         )
+        if np.isfinite(candidate.fun) and (
+            result is None or candidate.fun < result.fun
+        ):
+            result = candidate
 
-        data_loss = np.mean(
-            (
-                predicted
-                - target
-            ) ** 2
-        )
+    if result is None:
+        raise RuntimeError("Optimisation échouée : perte non finie.")
 
-        penalty = reg * np.sum(
-            L ** 2
-        )
-
-        return float(
-            data_loss
-            + penalty
-        )
-
-    result = minimize(
-        objective,
-        x0=L0.ravel(),
-        method="L-BFGS-B",
-        options={
-            "maxiter": max_iter,
-            "ftol": 1e-12,
-            "gtol": 1e-8,
-            "maxls": 50,
-        },
-    )
-
-    L_hat = unpack(
-        result.x
-    )
+    L_hat = unpack(result.x)
 
     W_hat = L_hat @ L_hat.T
 
     latent = X @ L_hat
 
-    delta = (
-        latent[
-            i_upper
-        ]
-        - latent[
-            j_upper
-        ]
-    )
+    delta = latent[i_upper] - latent[j_upper]
 
-    predicted = np.linalg.norm(
-        delta,
-        axis=1,
-    )
+    predicted = np.linalg.norm(delta, axis=1)
 
-    data_loss = float(
-        np.mean(
-            (
-                predicted
-                - target
-            ) ** 2
-        )
-    )
+    data_loss = float(np.mean((predicted - target) ** 2))
 
-    penalty = float(
-        reg
-        * np.sum(
-            L_hat ** 2
-        )
-    )
+    penalty = float(reg * np.sum(L_hat ** 2))
 
-    final_loss = float(
-        data_loss
-        + penalty
-    )
+    final_loss = float(data_loss + penalty)
 
     if not result.success:
         warnings.warn(
-            "Optimisation non convergée : "
-            f"{result.message}",
+            "Optimisation non convergée : " f"{result.message}",
             RuntimeWarning,
         )
 
@@ -1062,15 +745,9 @@ def fit_from_pairwise_dissimilarity(
         return FitResult(
             L=L_hat,
             W=W_hat,
-            success=bool(
-                result.success
-            ),
-            message=str(
-                result.message
-            ),
-            n_iter=int(
-                result.nit
-            ),
+            success=bool(result.success),
+            message=str(result.message),
+            n_iter=int(result.nit),
             final_loss=final_loss,
             data_loss=data_loss,
             penalty=penalty,
@@ -1093,6 +770,7 @@ def select_k_by_pair_cv(
     max_iter: int = 1500,
     random_state: int = 42,
     verbose: bool = True,
+    selection_rule: str = "min",
 ) -> CVResult:
     """
     Sélectionne k par validation croisée de paires.
@@ -1100,108 +778,61 @@ def select_k_by_pair_cv(
     Les mêmes états apparaissent en entraînement et en validation.
     Le protocole mesure l'interpolation de nouvelles paires entre états
     connus, et non la généralisation à de nouveaux états.
+
+    Le prétraitement est estimé sur tous les états : c'est cohérent ici car
+    les états ne sont pas tenus à l'écart, seulement les paires.
     """
-    features, distances = _validate_xy(
-        X,
-        D,
-    )
+    features, distances = _validate_xy(X, D)
 
     n_states, n_features = features.shape
 
-    n_splits = _positive_integer(
-        n_splits,
-        "n_splits",
-    )
+    n_splits = _positive_integer(n_splits, "n_splits")
 
-    i_all, j_all = upper_tri_pairs(
-        n_states
-    )
+    i_all, j_all = upper_tri_pairs(n_states)
 
     n_pairs = len(i_all)
 
     if n_splits > n_pairs:
-        raise ValueError(
-            "Le nombre de folds dépasse le nombre de paires."
-        )
+        raise ValueError("Le nombre de folds dépasse le nombre de paires.")
 
     candidates = sorted(
-        {
-            int(k)
-            for k in k_candidates
-            if 1 <= int(k) <= n_features
-        }
+        {int(k) for k in k_candidates if 1 <= int(k) <= n_features}
     )
 
     if not candidates:
-        raise ValueError(
-            "Aucun rang k valide."
-        )
+        raise ValueError("Aucun rang k valide.")
 
-    _, _, _, X_centered = _fit_preprocessing(
-        features,
-        standardize,
-    )
+    _, _, _, X_centered = _fit_preprocessing(features, standardize)
 
-    rng = np.random.default_rng(
-        random_state
-    )
+    rng = np.random.default_rng(random_state)
 
-    shuffled_pairs = rng.permutation(
-        n_pairs
-    )
+    shuffled_pairs = rng.permutation(n_pairs)
 
-    fold_sizes = np.full(
-        n_splits,
-        n_pairs // n_splits,
-        dtype=int,
-    )
+    fold_sizes = np.full(n_splits, n_pairs // n_splits, dtype=int)
 
-    fold_sizes[
-        : n_pairs % n_splits
-    ] += 1
+    fold_sizes[: n_pairs % n_splits] += 1
 
     folds = []
     start = 0
 
     for size in fold_sizes:
-        folds.append(
-            shuffled_pairs[
-                start : start + size
-            ]
-        )
+        folds.append(shuffled_pairs[start : start + size])
         start += size
 
-    scores = {
-        k: []
-        for k in candidates
-    }
+    scores = {k: [] for k in candidates}
 
-    for fold_index, validation_indices in enumerate(
-        folds
-    ):
-        train_mask = np.ones(
-            n_pairs,
-            dtype=bool,
-        )
+    for fold_index, validation_indices in enumerate(folds):
+        train_mask = np.ones(n_pairs, dtype=bool)
 
-        train_mask[
-            validation_indices
-        ] = False
+        train_mask[validation_indices] = False
 
         validation_mask = ~train_mask
 
-        validation_i = i_all[
-            validation_mask
-        ]
+        validation_i = i_all[validation_mask]
 
-        validation_j = j_all[
-            validation_mask
-        ]
+        validation_j = j_all[validation_mask]
 
-        validation_target = distances[
-            validation_i,
-            validation_j
-        ]
+        validation_target = distances[validation_i, validation_j]
 
         for k in candidates:
             L_hat, _ = fit_from_pairwise_dissimilarity(
@@ -1212,77 +843,35 @@ def select_k_by_pair_cv(
                 max_iter=max_iter,
                 pair_mask=train_mask,
                 init="random",
-                init_seed=random_state
-                + 10_000 * fold_index
-                + k,
+                init_seed=random_state + 10_000 * fold_index + k,
             )
 
             latent = X_centered @ L_hat
 
-            delta = (
-                latent[
-                    validation_i
-                ]
-                - latent[
-                    validation_j
-                ]
-            )
+            delta = latent[validation_i] - latent[validation_j]
 
-            predicted = np.linalg.norm(
-                delta,
-                axis=1,
-            )
+            predicted = np.linalg.norm(delta, axis=1)
 
-            mse = float(
-                np.mean(
-                    (
-                        predicted
-                        - validation_target
-                    ) ** 2
-                )
-            )
+            mse = float(np.mean((predicted - validation_target) ** 2))
 
-            scores[k].append(
-                mse
-            )
+            scores[k].append(mse)
 
         if verbose:
-            print(
-                f"[pair-cv] fold "
-                f"{fold_index + 1}/{n_splits} terminé."
-            )
+            print(f"[pair-cv] fold {fold_index + 1}/{n_splits} terminé.")
 
-    mean_scores = {
-        k: float(
-            np.mean(
-                values
-            )
-        )
-        for k, values in scores.items()
-    }
+    mean_scores = {k: float(np.mean(values)) for k, values in scores.items()}
 
     std_scores = {
-        k: float(
-            np.std(
-                values,
-                ddof=1,
-            )
-        )
-        if len(values) > 1
-        else 0.0
+        k: float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
         for k, values in scores.items()
     }
 
-    best_k = min(
-        mean_scores,
-        key=mean_scores.get,
+    best_k = _select_best_k(  # CORRECTION C3
+        mean_scores, std_scores, n_splits, selection_rule
     )
 
     if verbose:
-        print(
-            "\n[pair-cv] MSE de validation "
-            "entre états connus :"
-        )
+        print("\n[pair-cv] MSE de validation entre états connus :")
 
         for k in candidates:
             print(
@@ -1291,9 +880,7 @@ def select_k_by_pair_cv(
                 f"+/- {std_scores[k]:.6f}"
             )
 
-        print(
-            f"[pair-cv] meilleur k : {best_k}"
-        )
+        print(f"[pair-cv] meilleur k : {best_k}")
 
     return CVResult(
         protocol="pair",
@@ -1301,6 +888,7 @@ def select_k_by_pair_cv(
         scores=mean_scores,
         std_scores=std_scores,
         all_fold_scores=scores,
+        selection_rule=str(selection_rule).lower(),
     )
 
 
@@ -1318,6 +906,7 @@ def select_k_by_state_cv(
     max_iter: int = 1500,
     random_state: int = 42,
     verbose: bool = True,
+    selection_rule: str = "min",
 ) -> CVResult:
     """
     Sélectionne k par validation d'états tenus à l'écart.
@@ -1325,158 +914,85 @@ def select_k_by_state_cv(
     Les paramètres de prétraitement sont estimés uniquement sur les états
     d'entraînement de chaque fold, puis appliqués aux états de validation.
     """
-    features, distances = _validate_xy(
-        X,
-        D,
-    )
+    features, distances = _validate_xy(X, D)
 
     n_states, n_features = features.shape
 
-    n_splits = _positive_integer(
-        n_splits,
-        "n_splits",
-    )
+    n_splits = _positive_integer(n_splits, "n_splits")
 
     if n_splits > n_states:
-        raise ValueError(
-            "Le nombre de folds dépasse le nombre d'états."
-        )
+        raise ValueError("Le nombre de folds dépasse le nombre d'états.")
 
-    if n_states - math.ceil(
-        n_states / n_splits
-    ) < 2:
+    if n_states - math.ceil(n_states / n_splits) < 2:
         raise ValueError(
             "Chaque fold doit laisser au moins deux états d'entraînement."
         )
 
     candidates = sorted(
-        {
-            int(k)
-            for k in k_candidates
-            if 1 <= int(k) <= n_features
-        }
+        {int(k) for k in k_candidates if 1 <= int(k) <= n_features}
     )
 
     if not candidates:
-        raise ValueError(
-            "Aucun rang k valide."
-        )
+        raise ValueError("Aucun rang k valide.")
 
-    rng = np.random.default_rng(
-        random_state
-    )
+    rng = np.random.default_rng(random_state)
 
-    shuffled_states = rng.permutation(
-        n_states
-    )
+    shuffled_states = rng.permutation(n_states)
 
-    fold_sizes = np.full(
-        n_splits,
-        n_states // n_splits,
-        dtype=int,
-    )
+    fold_sizes = np.full(n_splits, n_states // n_splits, dtype=int)
 
-    fold_sizes[
-        : n_states % n_splits
-    ] += 1
+    fold_sizes[: n_states % n_splits] += 1
 
     folds = []
     start = 0
 
     for size in fold_sizes:
-        folds.append(
-            np.sort(
-                shuffled_states[
-                    start : start + size
-                ]
-            )
-        )
+        folds.append(np.sort(shuffled_states[start : start + size]))
         start += size
 
-    i_all, j_all = upper_tri_pairs(
-        n_states
-    )
+    i_all, j_all = upper_tri_pairs(n_states)
 
-    scores = {
-        k: []
-        for k in candidates
-    }
+    scores = {k: [] for k in candidates}
 
-    for fold_index, validation_states in enumerate(
-        folds
-    ):
-        validation_state_mask = np.zeros(
-            n_states,
-            dtype=bool,
+    warned_rank = False
+
+    for fold_index, validation_states in enumerate(folds):
+        validation_state_mask = np.zeros(n_states, dtype=bool)
+
+        validation_state_mask[validation_states] = True
+
+        training_states = np.where(~validation_state_mask)[0]
+
+        # CORRECTION C2 : avertissement au lieu d'une erreur.
+        if len(training_states) <= max(candidates) and not warned_rank:
+            warnings.warn(
+                "Moins d'états d'entraînement que le rang maximal demandé : "
+                "les rangs élevés ne sont pas identifiables et sont "
+                "contrôlés uniquement par la régularisation.",
+                RuntimeWarning,
+            )
+            warned_rank = True
+
+        X_training = features[training_states]
+
+        mu, sd, center, X_training_centered = _fit_preprocessing(
+            X_training, standardize
         )
 
-        validation_state_mask[
-            validation_states
-        ] = True
+        X_all_centered = _apply_preprocessing(features, mu, sd, center)
 
-        training_states = np.where(
-            ~validation_state_mask
-        )[0]
-
-        if len(training_states) <= max(
-            candidates
-        ):
-            raise ValueError(
-                "Trop peu d'états d'entraînement "
-                "pour le rang maximal demandé."
-            )
-
-        X_training = features[
-            training_states
-        ]
-
-        X_validation = features[
-            validation_states
-        ]
-
-        mu, sd, center, X_training_centered = (
-            _fit_preprocessing(
-                X_training,
-                standardize,
-            )
-        )
-
-        X_all_centered = _apply_preprocessing(
-            features,
-            mu,
-            sd,
-            center,
-        )
-
-        D_training = distances[
-            np.ix_(
-                training_states,
-                training_states,
-            )
-        ]
+        D_training = distances[np.ix_(training_states, training_states)]
 
         # Toutes les paires impliquant au moins un état de validation.
         validation_pair_mask = (
-            validation_state_mask[
-                i_all
-            ]
-            | validation_state_mask[
-                j_all
-            ]
+            validation_state_mask[i_all] | validation_state_mask[j_all]
         )
 
-        validation_i = i_all[
-            validation_pair_mask
-        ]
+        validation_i = i_all[validation_pair_mask]
 
-        validation_j = j_all[
-            validation_pair_mask
-        ]
+        validation_j = j_all[validation_pair_mask]
 
-        validation_target = distances[
-            validation_i,
-            validation_j
-        ]
+        validation_target = distances[validation_i, validation_j]
 
         for k in candidates:
             L_hat, _ = fit_from_pairwise_dissimilarity(
@@ -1487,39 +1003,18 @@ def select_k_by_state_cv(
                 max_iter=max_iter,
                 pair_mask=None,
                 init="random",
-                init_seed=random_state
-                + 10_000 * fold_index
-                + k,
+                init_seed=random_state + 10_000 * fold_index + k,
             )
 
             latent_all = X_all_centered @ L_hat
 
-            delta = (
-                latent_all[
-                    validation_i
-                ]
-                - latent_all[
-                    validation_j
-                ]
-            )
+            delta = latent_all[validation_i] - latent_all[validation_j]
 
-            predicted = np.linalg.norm(
-                delta,
-                axis=1,
-            )
+            predicted = np.linalg.norm(delta, axis=1)
 
-            mse = float(
-                np.mean(
-                    (
-                        predicted
-                        - validation_target
-                    ) ** 2
-                )
-            )
+            mse = float(np.mean((predicted - validation_target) ** 2))
 
-            scores[k].append(
-                mse
-            )
+            scores[k].append(mse)
 
         if verbose:
             print(
@@ -1528,37 +1023,19 @@ def select_k_by_state_cv(
                 f"{len(validation_states)} état(s) tenu(s) à l'écart."
             )
 
-    mean_scores = {
-        k: float(
-            np.mean(
-                values
-            )
-        )
-        for k, values in scores.items()
-    }
+    mean_scores = {k: float(np.mean(values)) for k, values in scores.items()}
 
     std_scores = {
-        k: float(
-            np.std(
-                values,
-                ddof=1,
-            )
-        )
-        if len(values) > 1
-        else 0.0
+        k: float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
         for k, values in scores.items()
     }
 
-    best_k = min(
-        mean_scores,
-        key=mean_scores.get,
+    best_k = _select_best_k(  # CORRECTION C3
+        mean_scores, std_scores, n_splits, selection_rule
     )
 
     if verbose:
-        print(
-            "\n[state-cv] MSE de validation "
-            "sur états tenus à l'écart :"
-        )
+        print("\n[state-cv] MSE de validation sur états tenus à l'écart :")
 
         for k in candidates:
             print(
@@ -1567,9 +1044,7 @@ def select_k_by_state_cv(
                 f"+/- {std_scores[k]:.6f}"
             )
 
-        print(
-            f"[state-cv] meilleur k : {best_k}"
-        )
+        print(f"[state-cv] meilleur k : {best_k}")
 
     return CVResult(
         protocol="state",
@@ -1577,6 +1052,7 @@ def select_k_by_state_cv(
         scores=mean_scores,
         std_scores=std_scores,
         all_fold_scores=scores,
+        selection_rule=str(selection_rule).lower(),
     )
 
 
@@ -1606,30 +1082,22 @@ class SubjectiveMetric:
         k_candidates: Sequence[int] = (1, 2, 3, 4, 5),
         n_splits: int = 5,
         cv_protocol: str = "pair",
+        selection_rule: str = "min",  # CORRECTION C3/C4 (en dernier)
     ):
         self.k = k
         self.reg = float(reg)
-        self.standardize = bool(
-            standardize
-        )
-        self.k_candidates = list(
-            k_candidates
-        )
-        self.n_splits = int(
-            n_splits
-        )
+        self.standardize = bool(standardize)
+        self.k_candidates = list(k_candidates)
+        self.n_splits = int(n_splits)
 
-        self.cv_protocol = str(
-            cv_protocol
-        ).lower()
+        self.cv_protocol = str(cv_protocol).lower()
 
-        if self.cv_protocol not in (
-            "pair",
-            "state",
-        ):
-            raise ValueError(
-                "cv_protocol doit être 'pair' ou 'state'."
-            )
+        if self.cv_protocol not in ("pair", "state"):
+            raise ValueError("cv_protocol doit être 'pair' ou 'state'.")
+
+        self.selection_rule = str(selection_rule).lower()
+        if self.selection_rule not in ("min", "one_se"):
+            raise ValueError("selection_rule doit être 'min' ou 'one_se'.")
 
         self.L_: Optional[np.ndarray] = None
         self.W_: Optional[np.ndarray] = None
@@ -1650,16 +1118,10 @@ class SubjectiveMetric:
     ) -> int:
         """Sélectionne k selon le protocole choisi."""
         candidates = (
-            self.k_candidates
-            if k_candidates is None
-            else k_candidates
+            self.k_candidates if k_candidates is None else k_candidates
         )
 
-        splits = (
-            self.n_splits
-            if n_splits is None
-            else n_splits
-        )
+        splits = self.n_splits if n_splits is None else n_splits
 
         if self.cv_protocol == "pair":
             selector = select_k_by_pair_cv
@@ -1675,6 +1137,7 @@ class SubjectiveMetric:
             standardize=self.standardize,
             random_state=random_state,
             verbose=verbose,
+            selection_rule=self.selection_rule,
         )
 
         self.k = self.cv_result_.best_k
@@ -1686,34 +1149,23 @@ class SubjectiveMetric:
         X: np.ndarray,
         D: np.ndarray,
         select_k: bool = False,
+        verbose: bool = True,  # CORRECTION C4
     ) -> "SubjectiveMetric":
         """
         Ajuste la métrique.
 
         Si select_k=True ou si k=None, la sélection croisée est exécutée.
         """
-        features, distances = _validate_xy(
-            X,
-            D,
-        )
+        features, distances = _validate_xy(X, D)
 
         if select_k or self.k is None:
-            self.select_k(
-                features,
-                distances,
-                verbose=True,
-            )
+            self.select_k(features, distances, verbose=verbose)
 
         if self.k is None:
-            raise RuntimeError(
-                "k n'est pas défini."
-            )
+            raise RuntimeError("k n'est pas défini.")
 
-        mu, sd, center, X_centered = (
-            _fit_preprocessing(
-                features,
-                self.standardize,
-            )
+        mu, sd, center, X_centered = _fit_preprocessing(
+            features, self.standardize
         )
 
         self.mu_ = mu
@@ -1730,13 +1182,8 @@ class SubjectiveMetric:
             return_details=True,
         )
 
-        if not isinstance(
-            result,
-            FitResult,
-        ):
-            raise RuntimeError(
-                "Résultat d'ajustement inattendu."
-            )
+        if not isinstance(result, FitResult):
+            raise RuntimeError("Résultat d'ajustement inattendu.")
 
         self.L_ = result.L
         self.W_ = result.W
@@ -1752,16 +1199,12 @@ class SubjectiveMetric:
         self._check_is_fitted()
 
         if self.mu_ is None:
-            raise RuntimeError(
-                "Les paramètres de centrage sont absents."
-            )
+            raise RuntimeError("Les paramètres de centrage sont absents.")
 
-        return _apply_preprocessing(
-            X,
-            self.mu_,
-            self.sd_,
-            self.center_,
-        ) @ self.L_
+        return (
+            _apply_preprocessing(X, self.mu_, self.sd_, self.center_)
+            @ self.L_
+        )
 
     def pairwise_distances(
         self,
@@ -1771,16 +1214,10 @@ class SubjectiveMetric:
         self._check_is_fitted()
 
         X_centered = _apply_preprocessing(
-            X,
-            self.mu_,
-            self.sd_,
-            self.center_,
+            X, self.mu_, self.sd_, self.center_
         )
 
-        return predict_distances(
-            X_centered,
-            self.L_,
-        )
+        return predict_distances(X_centered, self.L_)
 
     def latent_volume(
         self,
@@ -1790,16 +1227,10 @@ class SubjectiveMetric:
         self._check_is_fitted()
 
         X_centered = _apply_preprocessing(
-            X,
-            self.mu_,
-            self.sd_,
-            self.center_,
+            X, self.mu_, self.sd_, self.center_
         )
 
-        return latent_volume(
-            X_centered,
-            self.L_,
-        )
+        return latent_volume(X_centered, self.L_)
 
     def _check_is_fitted(
         self,
@@ -1810,9 +1241,7 @@ class SubjectiveMetric:
             or self.sd_ is None
             or self.center_ is None
         ):
-            raise RuntimeError(
-                "Estimateur non ajusté. Appelez fit()."
-            )
+            raise RuntimeError("Estimateur non ajusté. Appelez fit().")
 
 
 # ============================================================================
@@ -1820,27 +1249,15 @@ class SubjectiveMetric:
 # ============================================================================
 
 if __name__ == "__main__":
-    rng = np.random.default_rng(
-        2026
-    )
+    rng = np.random.default_rng(2026)
 
     n_states = 30
     n_features = 8
     k_true = 3
 
-    X = rng.standard_normal(
-        (
-            n_states,
-            n_features,
-        )
-    )
+    X = rng.standard_normal((n_states, n_features))
 
-    L_true = np.zeros(
-        (
-            n_features,
-            k_true,
-        )
-    )
+    L_true = np.zeros((n_features, k_true))
 
     L_true[0, 0] = 1.4
     L_true[2, 0] = -0.9
@@ -1849,39 +1266,17 @@ if __name__ == "__main__":
     L_true[3, 2] = 1.0
     L_true[6, 2] = -0.6
 
-    i_upper, j_upper = upper_tri_pairs(
-        n_states
-    )
+    i_upper, j_upper = upper_tri_pairs(n_states)
 
-    true_distances = np.linalg.norm(
-        (
-            X[i_upper]
-            - X[j_upper]
-        ) @ L_true,
-        axis=1,
-    )
+    true_distances = np.linalg.norm((X[i_upper] - X[j_upper]) @ L_true, axis=1)
 
-    similarity = np.zeros(
-        (
-            n_states,
-            n_states,
-        )
-    )
+    similarity = np.zeros((n_states, n_states))
 
-    similarity[
-        i_upper,
-        j_upper
-    ] = 7.0 - true_distances
+    similarity[i_upper, j_upper] = 7.0 - true_distances
 
-    similarity[
-        j_upper,
-        i_upper
-    ] = 7.0 - true_distances
+    similarity[j_upper, i_upper] = 7.0 - true_distances
 
-    np.fill_diagonal(
-        similarity,
-        7.0,
-    )
+    np.fill_diagonal(similarity, 7.0)
 
     D = similarity_to_dissimilarity(
         similarity,
@@ -1890,9 +1285,7 @@ if __name__ == "__main__":
         max_similarity=7.0,
     )
 
-    print(
-        "=== Validation croisée par paires ==="
-    )
+    print("=== Validation croisée par paires ===")
 
     pair_metric = SubjectiveMetric(
         k=None,
@@ -1903,31 +1296,17 @@ if __name__ == "__main__":
         cv_protocol="pair",
     )
 
-    pair_metric.fit(
-        X,
-        D,
-        select_k=True,
-    )
+    pair_metric.fit(X, D, select_k=True)
 
-    print(
-        f"Rang sélectionné : {pair_metric.k}"
-    )
+    print(f"Rang sélectionné : {pair_metric.k}")
 
-    print(
-        f"Succès optimisation : "
-        f"{pair_metric.fit_result_.success}"
-    )
+    print(f"Succès optimisation : {pair_metric.fit_result_.success}")
 
-    print(
-        f"Volume latent : "
-        f"{pair_metric.latent_volume(X):.6f}"
-    )
+    print(f"Volume latent : {pair_metric.latent_volume(X):.6f}")
 
     print()
 
-    print(
-        "=== Validation croisée par états ==="
-    )
+    print("=== Validation croisée par états ===")
 
     state_metric = SubjectiveMetric(
         k=None,
@@ -1938,22 +1317,10 @@ if __name__ == "__main__":
         cv_protocol="state",
     )
 
-    state_metric.fit(
-        X,
-        D,
-        select_k=True,
-    )
+    state_metric.fit(X, D, select_k=True)
 
-    print(
-        f"Rang sélectionné : {state_metric.k}"
-    )
+    print(f"Rang sélectionné : {state_metric.k}")
 
-    print(
-        f"Succès optimisation : "
-        f"{state_metric.fit_result_.success}"
-    )
+    print(f"Succès optimisation : {state_metric.fit_result_.success}")
 
-    print(
-        f"Volume latent : "
-        f"{state_metric.latent_volume(X):.6f}"
-)
+    print(f"Volume latent : {state_metric.latent_volume(X):.6f}")
